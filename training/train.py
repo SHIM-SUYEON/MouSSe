@@ -1,0 +1,1848 @@
+import os
+import sys
+
+# Make the top-level ``mousse`` package importable when running this script
+# directly (repo root is the parent of this training/ directory).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+import shutil
+import time
+import math
+import random
+import gc
+from itertools import permutations
+from pathlib import Path
+from typing import Dict, Optional, Any
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.autograd.forward_ad as fwad
+from einops import rearrange, reduce
+from tqdm import tqdm
+from accelerate import Accelerator, DistributedDataParallelKwargs
+import wandb
+import torchaudio
+from scipy.optimize import linear_sum_assignment
+from torch.utils.data import DataLoader, Subset
+from torchmetrics.audio import (
+    ShortTimeObjectiveIntelligibility,
+    PerceptualEvaluationSpeechQuality,
+    ScaleInvariantSignalNoiseRatio,
+)
+
+try:
+    import optuna
+    from optuna.samplers import TPESampler
+    from optuna.pruners import MedianPruner
+except ImportError:
+    raise RuntimeError("Install optuna: pip install optuna")
+
+from mousse.configs import config
+from mousse.models import AudioFlow, UncertaintyHead
+from mousse.models.tensors import count_parameters
+from mousse.utils.dataset import make_dataset
+
+# -----------------------------------------------------------------
+# STNO conditioning projection (Stage 2)
+# -----------------------------------------------------------------
+class STNOProjection(torch.nn.Module):
+    """Maps oracle STNO features (p_T, p_N, p_O, slot_id) into the backbone's
+    hidden space via the existing 'condition' pathway in generic_safe_forward.
+    Zero-init on the output layer so conditioning starts as identity."""
+    def __init__(self, n_dim: int):
+        super().__init__()
+        self.proj = torch.nn.Sequential(
+            torch.nn.Linear(4, n_dim // 4),
+            torch.nn.SiLU(),
+            torch.nn.Dropout(p=0.1),
+            torch.nn.Linear(n_dim // 4, n_dim),
+        )
+        torch.nn.init.zeros_(self.proj[3].weight)
+        torch.nn.init.zeros_(self.proj[3].bias)
+
+    def forward(self, p_T: torch.Tensor, p_N: torch.Tensor,
+                p_O: torch.Tensor, slot_id: torch.Tensor) -> torch.Tensor:
+        feat = torch.stack([p_T, p_N, p_O, slot_id], dim=-1)  # [B, T, 4]
+        return self.proj(feat)                                  # [B, T, n_dim]
+
+
+def make_slot_id(B: int, n_src: int, T_single: int, device) -> torch.Tensor:
+    slot_id = torch.zeros(B, n_src * T_single, device=device)
+    for s in range(n_src):
+        slot_id[:, s * T_single:(s + 1) * T_single] = s / max(n_src - 1, 1)
+    return slot_id
+
+# from pyannote.audio import Pipeline
+
+# -----------------------------------------------------------------
+# Paths  (same as train_b1_v2_libri.py)
+# -----------------------------------------------------------------
+PRETRAINED_BACKBONE_PATH = Path(
+    "/shared/NAS_SSD/syshim/hi-d/bluejays/ss-librimix/librimix-sep-01.pt"
+)
+STAGE1_SAVE_PATH = Path(
+    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/single-stage/0826/"
+)
+STAGE2_SAVE_PATH = Path(
+    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/stage2-0819/"
+)
+HP_SEARCH_PATH = Path(
+    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/hyper/stage1/"
+)
+# FT_VOCODER_PATH = Path(
+#     "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/vocoder_ft/vocoder_ft.pt"
+# )
+FT_VOCODER_PATH = None
+OPTUNA_DB = f"sqlite:///{HP_SEARCH_PATH}/optuna.db"
+
+for _p in [STAGE1_SAVE_PATH, STAGE2_SAVE_PATH, HP_SEARCH_PATH]:
+    os.makedirs(_p, exist_ok=True)
+
+print(f"STAGE1_SAVE_PATH: {STAGE1_SAVE_PATH}")
+print(f"STAGE2_SAVE_PATH: {STAGE2_SAVE_PATH}")
+
+# -----------------------------------------------------------------
+# HP search control
+# -----------------------------------------------------------------
+HP_SEARCH_MODE = False #False  # search done — trial #14 won (11.03 dB mel-SI-SNRi)
+
+STAGE1_SEARCH_STEPS      = 10000
+STAGE1_SEARCH_EVAL_EVERY = 2500
+STAGE1_N_TRIALS          = 20
+
+STAGE2_SEARCH_STEPS      = 2000
+STAGE2_SEARCH_EVAL_EVERY = 500
+STAGE2_N_TRIALS          = 20
+
+HP_SEARCH_EVAL_N = 50   # val samples per n_src for fast mel proxy
+
+STAGE1_FULL_STEPS    = 120000
+STAGE1_FULL_SAVE_EV  = [30000, 47500, 60000] # 10000
+STAGE1_FULL_EVAL_EV  = 1000
+STAGE2_FULL_STEPS    = 50000
+STAGE2_FULL_SAVE_EV  = 10000
+STAGE2_FULL_EVAL_EV  = 50000
+TRAIN_LOG_EVERY      = 1
+
+# Early stopping (Stage 1 full-training only)
+# Fires after EARLY_STOP_PATIENCE_EVALS consecutive evals without ≥ EARLY_STOP_MIN_DELTA_DB gain.
+# At eval_every=1000 and patience=20 this means 20 000 steps without meaningful improvement.
+EARLY_STOP_PATIENCE_EVALS = 20
+EARLY_STOP_MIN_DELTA_DB   = 0.2
+
+STAGE1_EXPERIMENT = "large-sep-0820"
+STAGE2_EXPERIMENT = "large-uq-0820"
+
+MANUAL_STAGE1_HP: Dict[str, Any] = {
+    "lr_max": 1.40251473845546e-05,
+    "lr_start": 2.6475736370673437e-08,
+    "warmup_steps": 4348,
+    "clip_norm": 0.08034961599688825,
+    "sigma": 3.2629595908661235e-06,
+    "batch_size": 4,
+    "grad_accum": 4,
+}
+MANUAL_STAGE2_HP: Dict[str, Any] = {
+    "lr_max": 1e-5,
+    "lr_start": 1e-8,
+    "warmup_steps": 1000,
+    "clip_norm": 0.5,
+    "sigma": 1e-5,
+    "batch_size": 4,
+    "grad_accum": 2,
+}
+
+# -----------------------------------------------------------------
+# Dataset / training constants
+# -----------------------------------------------------------------
+N_SRC_LIST            = [2, 3, 4]
+VAL_SAMPLES_PER_NSRC  = 100 #1300    # 3 x 200 = 600 total val (was 1300, reduced for speed)
+TRAIN_LOADER_WORKERS  = 5
+TRAIN_MIXED_PRECISION = "bf16"
+VOCODER_SAMPLE_RATE   = 24000  # bigvsan generates at 24 kHz; do_vocoder resamples to config.audio.sample_rate (16 kHz)
+MAX_FRAMES_PER_SPK    = 600 #300
+MAX_EVAL_FRAMES_PER_SPK = 1500 #1200
+
+train_project = "mousse-stage1"
+
+# -----------------------------------------------------------------
+# Pyannote 3.1
+# -----------------------------------------------------------------
+
+# pipeline = Pipeline.from_pretrained(
+#   "pyannote/speaker-diarization-3.1",
+#   use_auth_token="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")
+# pipeline.to(torch.device("cuda"))
+# diarization = pipeline("audio.wav", min_speakers=2, max_speakers=4)
+
+# -----------------------------------------------------------------
+# Loss functions
+# -----------------------------------------------------------------
+def pit_mse_loss(pred, target, n_src, mask=None):
+    B, L, D = pred.shape
+    T = L // n_src
+    pred_slots   = [pred[:, s*T:(s+1)*T, :]   for s in range(n_src)]
+    target_slots = [target[:, s*T:(s+1)*T, :] for s in range(n_src)]
+    mask_slots   = (
+        [mask[:, s*T:(s+1)*T] for s in range(n_src)]
+        if mask is not None else [None] * n_src
+    )
+    best_loss = None
+    for perm in permutations(range(n_src)):
+        perm_terms = []
+        for i in range(n_src):
+            slot_loss = F.mse_loss(pred_slots[i], target_slots[perm[i]], reduction="none").mean(dim=-1)
+            m = mask_slots[perm[i]]
+            if m is not None:
+                nvalid = m.float().sum().clamp(min=1)
+                slot_loss = (slot_loss * m.float()).sum() / nvalid
+            else:
+                slot_loss = slot_loss.mean()
+            perm_terms.append(slot_loss)
+        perm_loss = torch.stack(perm_terms).mean()
+        if best_loss is None or perm_loss < best_loss:
+            best_loss = perm_loss
+    return best_loss
+
+
+def pit_nll_loss(pred_mean, pred_log_sigma, target, n_src, mask=None):
+    B, L, D = pred_mean.shape
+    T = L // n_src
+    mean_slots = [pred_mean[:, s*T:(s+1)*T, :]      for s in range(n_src)]
+    lsig_slots = [pred_log_sigma[:, s*T:(s+1)*T, :] for s in range(n_src)]
+    tgt_slots  = [target[:, s*T:(s+1)*T, :]         for s in range(n_src)]
+    mask_slots = (
+        [mask[:, s*T:(s+1)*T] for s in range(n_src)]
+        if mask is not None else [None] * n_src
+    )
+    var_slots = [torch.exp(ls) ** 2 for ls in lsig_slots]
+    best_loss = None
+    for perm in permutations(range(n_src)):
+        perm_terms = []
+        for i in range(n_src):
+            j = perm[i]
+            error_sq = (mean_slots[i] - tgt_slots[j]) ** 2
+            nll = error_sq / (2 * var_slots[i]) + lsig_slots[i]
+            m = mask_slots[j]
+            if m is not None:
+                m_exp = m.unsqueeze(-1).expand_as(nll)
+                nvalid = m_exp.float().sum().clamp(min=1)
+                perm_terms.append((nll * m_exp.float()).sum() / nvalid)
+            else:
+                perm_terms.append(nll.mean())
+        perm_loss = torch.stack(perm_terms).mean()
+        if best_loss is None or perm_loss < best_loss:
+            best_loss = perm_loss
+    return best_loss
+
+
+def do_vocoder(spec, vocoder, device):
+    with torch.no_grad():
+        wav = vocoder.generate(spec.T.to(torch.float32).to(device)).squeeze(0)
+    if VOCODER_SAMPLE_RATE != config.audio.sample_rate:
+        wav = torchaudio.functional.resample(wav.unsqueeze(0), VOCODER_SAMPLE_RATE, config.audio.sample_rate).squeeze(0)
+    return wav
+
+
+
+_VOCODER_CACHE = None
+
+def get_vocoder(device):
+    global _VOCODER_CACHE
+    if _VOCODER_CACHE is not None:
+        return _VOCODER_CACHE.to(device)
+    cached_hub = os.path.expanduser("~/.cache/torch/hub/ex3ndr_supervoice-vocoder_master")
+    print(f"Cached hub: {cached_hub}")
+    # exit()
+    try:
+        src = cached_hub if os.path.exists(cached_hub) else "ex3ndr/supervoice-vocoder"
+        load_kw = dict(source="local") if os.path.exists(cached_hub) else {}
+        vocoder = torch.hub.load(src, "bigvsan", **load_kw)
+        # if FT_VOCODER_PATH.exists():
+        if FT_VOCODER_PATH is not None and FT_VOCODER_PATH.exists():
+            ft_ckpt = torch.load(str(FT_VOCODER_PATH), map_location="cpu")
+            vocoder.load_state_dict(ft_ckpt["vocoder"])
+            print("[VOCODER] Fine-tuned vocoder loaded.")
+        else:
+            print("[VOCODER] Using base vocoder weights.")
+        vocoder = vocoder.eval()
+        _VOCODER_CACHE = vocoder
+        return vocoder.to(device)
+    except Exception as e:
+        print(f"[VOCODER] Unavailable: {e}")
+        return None
+
+
+
+def _rms_normalize(wav: torch.Tensor, target_rms: float = 0.1) -> torch.Tensor:
+    rms = wav.pow(2).mean().sqrt()
+    if rms < 1e-8:
+        return wav
+    return wav * (target_rms / rms)
+
+
+def fast_euler_sample_uq(
+    predictor, uq_head, audio: torch.Tensor,
+    steps: int = 16, alpha: float = 1.5,
+    lambda_max: float = 2.0, use_uq_guidance: bool = True,
+    condition=None,
+) -> torch.Tensor:
+    """Fixed-step Euler ODE integration for evaluation.
+    Skips JVP and adaptive stepping (U is discarded by callers anyway),
+    reducing cost to 4 forward passes/step (use_uq_guidance=True)
+    or 2 passes/step (use_uq_guidance=False, alpha!=0)
+    vs. 6 passes * up to 128 steps in sample_with_uncertainty."""
+    device = audio.device
+    batch_size = audio.shape[0]
+    z = torch.randn_like(audio)
+    dt = 1.0 / steps
+    audio_empty = torch.zeros_like(audio)
+
+    with torch.no_grad():
+        with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+            for i in range(steps):
+                t_batch = torch.full((batch_size,), i * dt, device=device, dtype=audio.dtype)
+                v_cond   = predictor(audio=audio,       noise=z, times=t_batch, condition=condition)
+                v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
+
+                if use_uq_guidance:
+                    log_s_uncond = uq_head(audio=audio_empty, noise=z, times=t_batch)
+                    log_s_cond   = uq_head(audio=audio,       noise=z, times=t_batch, condition=condition)
+                    sigma_uncond = torch.exp(log_s_uncond)
+                    sigma_cond   = torch.exp(log_s_cond)
+                    num = torch.sum(sigma_uncond * sigma_cond - sigma_cond ** 2, dim=-1, keepdim=True)
+                    den = torch.sum((sigma_cond - sigma_uncond) ** 2, dim=-1, keepdim=True).clamp(min=1e-8)
+                    lambda_star = torch.clamp(num / den, min=0.0, max=lambda_max)
+                    v_guided = v_cond + (v_cond - v_uncond) * lambda_star
+                else:
+                    v_guided = v_cond + (v_cond - v_uncond) * alpha
+
+                z = z + v_guided.float() * dt
+    return z
+
+
+# -----------------------------------------------------------------
+# Eval stats for wandb
+# -----------------------------------------------------------------
+def compute_eval_stats(
+    predictor, val_loaders_dict: dict, device, sigma: float = 1e-5, n_per_nsrc: int = 5,
+    stno_proj=None,
+) -> Dict[str, float]:
+    predictor.eval()
+    if stno_proj is not None:
+        stno_proj.eval()
+    total_loss = 0.0
+    n_done = 0
+    pred_bufs: list = []
+    tgt_bufs:  list = []
+
+    with torch.no_grad():
+        for n_src, val_loader in val_loaders_dict.items():
+            val_iter = iter(val_loader)
+            for _ in range(min(n_per_nsrc, len(val_loader.dataset))):
+                try:
+                    batch = next(val_iter)
+                except StopIteration:
+                    break
+                cond = batch[0].to(device)
+                tgt  = batch[1].to(device)
+                
+                # Dynamic determination of single speaker frames
+                if tgt.ndim == 4:
+                    T_single = tgt.shape[2]
+                else:
+                    T_single = cond.shape[1] // n_src
+                    
+                # Enforce frame length truncation rule (MAX_FRAMES_PER_SPK = 200)
+                if T_single > MAX_FRAMES_PER_SPK:
+                    T_single = MAX_FRAMES_PER_SPK
+                
+                T_total = T_single * n_src
+
+                # Extract Oracle STNO matrix with strict dimension handling
+                if tgt.ndim == 4:
+                    # tgt shape: [B, n_src, T_single_orig, D]
+                    d_st = (tgt.abs().sum(dim=-1) > 1e-4).float()
+                    d_st = d_st[:, :, :T_single]
+                    
+                    tgt_flat = rearrange(tgt, "b s t d -> b (s t) d")
+                    cond_flat = torch.repeat_interleave(cond, repeats=n_src, dim=1)
+                else:
+                    # tgt shape: [B, T_total_orig, D]
+                    d_st_total = (tgt.abs().sum(dim=-1) > 1e-4).float()
+                    d_st_total = d_st_total[:, :T_total]
+                    
+                    # Reshape to [B, n_src, T_single] safely before Eq.(1) formulation
+                    d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
+                    
+                    tgt_flat = tgt
+                    cond_flat = cond
+                
+                # Slice time dimensions to the target T_total limit
+                tgt_flat = tgt_flat[:, :T_total, :]
+                cond_flat = cond_flat[:, :T_total, :]
+
+                with torch.no_grad():
+                    # Compute STNO probabilities strictly following Eq. (1) for eval consistency
+                    p_S = torch.prod(1.0 - d_st, dim=1, keepdim=True) # [B, 1, T_single]
+                    
+                    p_T_list, p_N_list, p_O_list = [], [], []
+                    for s_k in range(n_src):
+                        d_sk = d_st[:, s_k:s_k+1, :]
+                        mask_other = torch.ones_like(d_st)
+                        mask_other[:, s_k, :] = 0.0
+                        p_other = torch.prod(1.0 - (d_st * mask_other), dim=1, keepdim=True)
+                        
+                        p_T_sk = d_sk * p_other
+                        p_O_sk = d_sk * (1.0 - p_other)
+                        p_N_sk = (1.0 - p_S) - p_T_sk - p_O_sk
+                        
+                        p_T_list.append(p_T_sk)
+                        p_N_list.append(p_N_sk)
+                        p_O_list.append(p_O_sk)
+                        
+                    p_T = torch.cat(p_T_list, dim=1)
+                    p_N = torch.cat(p_N_list, dim=1)
+                    p_O = torch.cat(p_O_list, dim=1)
+
+                    # Flatten STNO conditions to align with time-concatenated slots
+                    p_T_flat = rearrange(p_T, "b s t -> b (s t)").unsqueeze(-1)
+                    p_N_flat = rearrange(p_N, "b s t -> b (s t)").unsqueeze(-1)
+                    p_O_flat = rearrange(p_O, "b s t -> b (s t)").unsqueeze(-1)
+
+                # Normalize (no input-space STNO multiplication; condition pathway used instead)
+                norm_cond = (cond_flat - config.audio.norm_mean) / config.audio.norm_std
+                norm_tgt  = (tgt_flat  - config.audio.norm_mean) / config.audio.norm_std
+
+                B_orig = norm_tgt.shape[0]
+                # Fixed t=0.5 gives deterministic, low-variance eval_loss across calls.
+                # Random t (old) caused 2× oscillation because MSE(t≈0) >> MSE(t≈1).
+                u       = torch.full((B_orig,), 0.5, dtype=torch.float32, device=device)
+                t_bc    = rearrange(u, "b -> b 1 1").expand_as(norm_tgt)
+                noise   = torch.randn_like(norm_tgt)
+                z       = (1.0 - (1.0 - sigma) * t_bc) * noise + t_bc * norm_tgt
+                vel_tgt = norm_tgt - (1.0 - sigma) * noise
+
+                stno_condition = None
+                if stno_proj is not None:
+                    slot_id_e = make_slot_id(B_orig, n_src, T_single, device)
+                    stno_condition = stno_proj(
+                        p_T_flat.squeeze(-1), p_N_flat.squeeze(-1),
+                        p_O_flat.squeeze(-1), slot_id_e,
+                    )
+
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    pred = predictor(audio=norm_cond, noise=z, times=u, condition=stno_condition)
+                
+                # Compute MSE loss based on time-concatenated 1:1 Target Speaker Extraction
+                loss = F.mse_loss(pred.float(), vel_tgt.float())
+                total_loss += loss.item()
+                
+                recon = (pred + (1.0 - sigma) * noise).detach().cpu()
+                pred_bufs.append(recon.flatten())
+                tgt_bufs.append(norm_tgt.cpu().flatten())
+                n_done += 1
+
+    pred_all = torch.cat(pred_bufs) if pred_bufs else torch.tensor([0.0])
+    tgt_all  = torch.cat(tgt_bufs)  if tgt_bufs  else torch.tensor([0.0])
+    if stno_proj is not None:
+        stno_proj.train()
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return {
+        "eval_loss":      total_loss / max(1, n_done),
+        "predicted/max":  pred_all.max().item(),
+        "predicted/mean": pred_all.mean().item(),
+        "predicted/min":  pred_all.min().item(),
+        "target/max":     tgt_all.max().item(),
+        "target/mean":    tgt_all.mean().item(),
+        "target/min":     tgt_all.min().item(),
+    }
+
+
+# -----------------------------------------------------------------
+# Full waveform evaluation
+# -----------------------------------------------------------------
+def evaluate_metrics(
+    predictor, uq_head, val_loaders_dict, device, accelerator, save_directory,
+    stage=1, step=0, max_samples=VAL_SAMPLES_PER_NSRC,
+):
+    predictor.eval()
+    uq_head.eval()
+
+    sr      = config.audio.sample_rate
+    PESQ_SR = 16000
+    stoi_m  = ShortTimeObjectiveIntelligibility(fs=sr).to(device)
+    pesq_m  = PerceptualEvaluationSpeechQuality(fs=PESQ_SR, mode="wb").to(device)
+    sisnr_m = ScaleInvariantSignalNoiseRatio().to(device)
+
+    vocoder = get_vocoder(device)
+
+    eval_wav_dir = os.path.join(save_directory, f"step_{step}")
+    if accelerator.is_main_process and vocoder is not None:
+        os.makedirs(eval_wav_dir, exist_ok=True)
+
+    total_stoi,   n_stoi  = 0., 0
+    total_pesq,   n_pesq  = 0., 0
+    total_sisnri, n_sisnr = 0., 0
+
+    for n_src, val_loader in val_loaders_dict.items():
+        n_samples = min(max_samples, len(val_loader.dataset))
+        val_iter  = iter(val_loader)
+
+        for item_idx in range(n_samples):
+            try:
+                condition_spec, flow_target, batch_mix_paths, batch_src_paths = next(val_iter)
+            except StopIteration:
+                break
+
+            if flow_target.ndim == 4:
+                flow_target    = rearrange(flow_target, "b s t d -> b (s t) d")
+                condition_spec = torch.repeat_interleave(condition_spec, repeats=n_src, dim=1)
+
+            single_cond    = condition_spec[0:1].to(device)
+            single_target  = flow_target[0:1].to(device)
+            item_src_paths = batch_src_paths[0] if batch_src_paths else []
+
+            seq_len   = single_cond.shape[1]
+            T_per_spk = seq_len // n_src
+            if T_per_spk > MAX_EVAL_FRAMES_PER_SPK:
+                T_per_spk     = MAX_EVAL_FRAMES_PER_SPK
+                seq_len       = T_per_spk * n_src
+                single_cond   = single_cond[:, :seq_len, :]
+                single_target = single_target[:, :seq_len, :]
+
+            if stage == 2:
+                # Apply the same oracle STNO conditioning used in training so
+                # backbone sees in-distribution input during evaluation.
+                with torch.no_grad():
+                    d_st_total = (single_target.abs().sum(dim=-1) > 1e-4).float()
+                    d_st = d_st_total.reshape(1, n_src, T_per_spk)
+                    p_S_e = torch.prod(1.0 - d_st, dim=1, keepdim=True)
+                    p_T_el, p_N_el, p_O_el = [], [], []
+                    for s_k in range(n_src):
+                        d_sk = d_st[:, s_k:s_k+1, :]
+                        mo = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
+                        p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
+                        p_T_el.append(d_sk * p_oth)
+                        p_O_el.append(d_sk * (1.0 - p_oth))
+                        p_N_el.append((1.0 - p_S_e) - d_sk * p_oth - d_sk * (1.0 - p_oth))
+                    p_T_e = torch.cat(p_T_el, dim=1).reshape(1, n_src * T_per_spk, 1)
+                    p_N_e = torch.cat(p_N_el, dim=1).reshape(1, n_src * T_per_spk, 1)
+                    p_O_e = torch.cat(p_O_el, dim=1).reshape(1, n_src * T_per_spk, 1)
+                    stno_cond = single_cond * (1.0 + 0.5 * p_T_e - 0.2 * p_N_e + 0.1 * p_O_e)
+                norm_cond = (stno_cond - config.audio.norm_mean) / config.audio.norm_std
+            else:
+                norm_cond = (single_cond - config.audio.norm_mean) / config.audio.norm_std
+            mix_input = norm_cond.to(dtype=torch.bfloat16)
+
+            eval_alpha = 0.0 if stage == 1 else 1.5
+            sep_spec = fast_euler_sample_uq(
+                predictor, uq_head, mix_input, steps=16,
+                alpha=eval_alpha, lambda_max=2.0, use_uq_guidance=True,
+            )
+
+            sep_flat  = sep_spec.detach()[0].to(torch.float32)
+            tgt_flat  = single_target[0].to(torch.float32)
+            cond_flat = single_cond[0].to(torch.float32)
+
+            # sep_flat is in normalized mel space (model output) → denormalize.
+            # tgt_flat comes from the dataset already in original mel scale → keep as-is.
+            denorm_sep  = sep_flat  * config.audio.norm_std + config.audio.norm_mean
+            denorm_tgt  = tgt_flat
+            denorm_cond = cond_flat
+
+            denorm_sep = torch.nan_to_num(denorm_sep, nan=0.0, posinf=1.0, neginf=-1.0)
+
+            pred_channels = [denorm_sep[s*T_per_spk:(s+1)*T_per_spk, :].flatten() for s in range(n_src)]
+            tgt_channels = [denorm_tgt[s*T_per_spk:(s+1)*T_per_spk, :].flatten() for s in range(n_src)]
+            mix_channels = [denorm_cond[0:T_per_spk, :].flatten() for _ in range(n_src)]
+
+            cost_mat = np.zeros((n_src, n_src))
+            for pi in range(n_src):
+                for ti in range(n_src):
+                    cost_mat[pi, ti] = -sisnr_m(pred_channels[pi], tgt_channels[ti]).item()
+            pred_ind, tgt_ind = linear_sum_assignment(cost_mat)
+
+            for pi, ti in zip(pred_ind, tgt_ind):
+                p_vec = pred_channels[pi]
+                t_vec = tgt_channels[ti]
+                m_vec = mix_channels[pi]
+                spec_shape = (T_per_spk, config.audio.n_mels)
+
+                try:
+                    sisnr_p   = -cost_mat[pi, ti]
+                    sisnr_mix = sisnr_m(m_vec, t_vec).item()
+                    total_sisnri += sisnr_p - sisnr_mix
+                    n_sisnr += 1
+                except Exception as e:
+                    print(f"[EVAL] SI-SNRi error n_src={n_src} spk={pi}: {e}")
+
+                wav_p_active = wav_t_active = None
+                src_mel_frames    = T_per_spk
+                actual_wav_frames = T_per_spk * config.audio.hop_size
+
+                if ti < len(item_src_paths):
+                    try:
+                        info = torchaudio.info(item_src_paths[ti])
+                        actual_wav_frames = int(info.num_frames * config.audio.sample_rate / info.sample_rate)
+                        src_mel_frames = min(int(actual_wav_frames / config.audio.hop_size), T_per_spk)
+                    except Exception:
+                        pass
+
+                if vocoder is not None:
+                    try:
+                        p_spec = p_vec.view(spec_shape)[:src_mel_frames]
+                        t_spec = t_vec.view(spec_shape)[:src_mel_frames]
+                        with torch.no_grad():
+                            wav_p_active = do_vocoder(p_spec, vocoder, device)
+                            wav_t_active = do_vocoder(t_spec, vocoder, device)
+                    except Exception as e:
+                        print(f"[EVAL] Vocoder error n_src={n_src} spk={pi}: {e}")
+
+                if wav_p_active is not None and wav_t_active is not None:
+                    wav_p_norm = _rms_normalize(wav_p_active)
+                    wav_t_norm = _rms_normalize(wav_t_active)
+                    # _rms_normalize returns the original tensor unchanged when RMS < 1e-8
+                    # (near-silent prediction). PESQ/STOI VADs will reject that audio, so
+                    # gate both metrics on a minimum post-normalization RMS.
+                    _MIN_RMS = 1e-3
+                    has_speech = (
+                        wav_p_norm.pow(2).mean().sqrt().item() >= _MIN_RMS and
+                        wav_t_norm.pow(2).mean().sqrt().item() >= _MIN_RMS
+                    )
+                    min_stoi_samples = int(sr * 0.5)
+                    if has_speech and wav_p_norm.shape[-1] >= min_stoi_samples and wav_t_norm.shape[-1] >= min_stoi_samples:
+                        try:
+                            total_stoi += stoi_m(wav_p_norm, wav_t_norm).item()
+                            n_stoi += 1
+                        except Exception as e:
+                            print(f"[EVAL] STOI error n_src={n_src} spk={pi}: {e}")
+                    min_pesq_samples = int(PESQ_SR * 0.25)
+                    if has_speech:
+                        try:
+                            wav_p_16k = torchaudio.functional.resample(wav_p_norm.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
+                            wav_t_16k = torchaudio.functional.resample(wav_t_norm.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
+                            if wav_p_16k.shape[-1] >= min_pesq_samples and wav_t_16k.shape[-1] >= min_pesq_samples:
+                                total_pesq += pesq_m(wav_p_16k, wav_t_16k).item()
+                                n_pesq += 1
+                        except Exception as e:
+                            print(f"[EVAL] PESQ error n_src={n_src} spk={pi}: {e}")
+
+                    if accelerator.is_main_process and item_idx == 0:
+                        wav_p_full = F.pad(wav_p_active, (0, max(0, actual_wav_frames - wav_p_active.shape[-1])))[:actual_wav_frames]
+                        src_stem = os.path.splitext(os.path.basename(item_src_paths[ti]))[0] if ti < len(item_src_paths) else "unknown"
+                        torchaudio.save(os.path.join(eval_wav_dir, f"n{n_src}_pred_spk{pi}_matched_to_spk{ti}__{src_stem}.wav"), wav_p_full.cpu().unsqueeze(0), sr)
+                        if step == 0:
+                            wav_t_full = F.pad(wav_t_active, (0, max(0, actual_wav_frames - wav_t_active.shape[-1])))[:actual_wav_frames]
+                            torchaudio.save(os.path.join(eval_wav_dir, f"n{n_src}_target_spk{ti}__{src_stem}.wav"), wav_t_full.cpu().unsqueeze(0), sr)
+                            with torch.no_grad():
+                                wav_mix = do_vocoder(denorm_cond[0:T_per_spk, :], vocoder, device)
+                            mix_len = T_per_spk * config.audio.hop_size
+                            wav_mix_full = F.pad(wav_mix, (0, max(0, mix_len - wav_mix.shape[-1])))[:mix_len]
+                            torchaudio.save(os.path.join(eval_wav_dir, f"n{n_src}_mixture.wav"), wav_mix_full.cpu().unsqueeze(0), sr)
+
+    del stoi_m, pesq_m, sisnr_m
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    metrics = {
+        "val/stoi":    total_stoi   / max(1, n_stoi),
+        "val/pesq":    total_pesq   / max(1, n_pesq),
+        "val/si_snri": total_sisnri / max(1, n_sisnr),
+    }
+    print(f"[EVAL] PIT-STOI: {metrics['val/stoi']:.4f} (n={n_stoi})  PIT-PESQ: {metrics['val/pesq']:.4f} (n={n_pesq})  SI-SNRi: {metrics['val/si_snri']:.2f} dB (n={n_sisnr})")
+    return metrics
+
+
+# -----------------------------------------------------------------
+# Model patches
+# -----------------------------------------------------------------
+def apply_training_patches():
+    import mousse.models.audio_flow as sf_model
+    from torch.nn.attention import sdpa_kernel, SDPBackend
+    from torch.utils.checkpoint import checkpoint as grad_checkpoint
+
+    def safe_sinu_forward(self, x):
+        x = x.reshape(-1)
+        x = rearrange(x, "b -> b 1")
+        freqs = x * rearrange(self.weights, "d -> 1 d") * 2 * math.pi
+        return torch.cat((freqs.sin(), freqs.cos()), dim=-1)
+
+    def generic_safe_forward(self, *, audio, noise, condition=None, times, mask=None, target=None, mask_loss=False):
+        _, _tangent = fwad.unpack_dual(noise)
+        is_jvp = (audio.ndim > 3) or (_tangent is not None)
+
+        if is_jvp:
+            backend_ctx = sdpa_kernel([SDPBackend.MATH])
+        elif self.training:
+            backend_ctx = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+        else:
+            backend_ctx = sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+
+        with backend_ctx:
+            combined = torch.cat([audio, noise], dim=-1)
+            if hasattr(self, "transformer_input"):
+                output = self.transformer_input(combined)
+            else:
+                output = self.input_layer(combined)
+            if condition is not None:
+                output = output + condition
+
+            orig_shape = list(output.shape)
+            seq_len  = orig_shape[-2]
+            feat_dim = orig_shape[-1]
+            leading  = orig_shape[:-2]
+
+            raw_sinu   = self.sinu_pos_emb(times)
+            sinu_times = raw_sinu.view(leading + [1, feat_dim])
+
+            output      = torch.cat([output, sinu_times], dim=-2)
+            output_flat = output.view(-1, seq_len + 1, feat_dim)
+            output_flat = self.conv_embed(output_flat) + output_flat
+
+            if self.training and not is_jvp:
+                output_flat = grad_checkpoint(self.transformer, output_flat, use_reentrant=False)
+            else:
+                output_flat = self.transformer(output_flat)
+
+            output_flat = self.prediction(output_flat)
+            output_flat = output_flat[..., :-1, :]
+            output = output_flat.view(leading + [seq_len, config.audio.n_mels])
+
+            if target is not None:
+                loss = F.mse_loss(output, target, reduction="none")
+                loss = reduce(loss, "b n d -> b n", "mean")
+                if mask_loss:
+                    loss = loss.masked_fill(~mask, 0.)
+                    n_masked = mask.sum(dim=-1).clamp(min=1)
+                    loss = loss.sum(dim=-1) / n_masked
+                else:
+                    loss = loss.sum(dim=-1) / target.shape[1]
+                return output, loss.mean()
+            return output
+
+    def patched_sample_with_uncertainty(self, *, audio, uq_head, steps, alpha=1.5, lambda_max=2.0, use_uq_guidance=False):
+        device     = audio.device
+        batch_size = audio.shape[0]
+        z          = torch.randn_like(audio)
+        U          = torch.zeros_like(audio)
+        dt_nominal = 1.0 / steps
+        gamma      = 10.0
+        t_curr     = 0.0
+        MAX_ITERS  = steps * 8
+        n_iter     = 0
+
+        while t_curr < 1.0 - 1e-6 and n_iter < MAX_ITERS:
+            n_iter += 1
+            t_batch     = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
+            audio_empty = torch.zeros_like(audio)
+
+            with torch.no_grad():
+                v_uncond     = self.forward(audio=audio_empty, noise=z, times=t_batch)
+                v_cond       = self.forward(audio=audio,       noise=z, times=t_batch)
+                log_s_uncond = uq_head(audio=audio_empty, noise=z, times=t_batch)
+                log_s_cond   = uq_head(audio=audio,       noise=z, times=t_batch)
+
+            sigma_uncond = torch.exp(log_s_uncond)
+            sigma_cond   = torch.exp(log_s_cond)
+
+            num = torch.sum(sigma_uncond * sigma_cond - sigma_cond ** 2, dim=-1, keepdim=True)
+            den = torch.sum((sigma_cond - sigma_uncond) ** 2, dim=-1, keepdim=True).clamp(min=1e-8)
+            lambda_star  = torch.clamp(num / den, min=0.0, max=lambda_max)
+            var_velocity = ((1.0 + lambda_star) * sigma_cond - lambda_star * sigma_uncond) ** 2
+
+            uq_mean_var = torch.mean(var_velocity).item()
+            dt_dynamic  = dt_nominal / (1.0 + gamma * uq_mean_var)
+            dt_dynamic  = max(dt_dynamic, dt_nominal / 4)
+            dt_dynamic  = min(dt_dynamic, 1.0 - t_curr)
+
+            if use_uq_guidance:
+                v_guided = v_cond + (v_cond - v_uncond) * lambda_star
+            else:
+                v_guided = v_cond + (v_cond - v_uncond) * alpha
+
+            rademacher = torch.randint(0, 2, z.shape, device=device, dtype=z.dtype) * 2 - 1
+            std_state  = torch.sqrt(U.clamp(min=1e-8))
+            v_vector   = std_state * rademacher
+
+            def local_velocity_fn(z_input):
+                t_in = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
+                v_u = self.forward(audio=torch.zeros_like(audio), noise=z_input, times=t_in)
+                v_c = self.forward(audio=audio, noise=z_input, times=t_in)
+                return v_c + (v_c - v_u) * alpha
+
+            with fwad.dual_level():
+                z_dual   = fwad.make_dual(z, v_vector)
+                out_dual = local_velocity_fn(z_dual)
+                _, jvp_out = fwad.unpack_dual(out_dual)
+
+            if jvp_out is None:
+                jvp_out = torch.zeros_like(z)
+
+            U      = U + (var_velocity * dt_dynamic) ** 2 + 2.0 * dt_dynamic * (v_vector * jvp_out)
+            z      = z + v_guided * dt_dynamic
+            t_curr = t_curr + dt_dynamic
+
+        return z, torch.mean(U, dim=-1)
+
+    sf_model.LearnedSinusoidalPosEmb.forward = safe_sinu_forward
+    sf_model.AudioFlow.forward = generic_safe_forward
+    sf_model.UncertaintyHead.forward = generic_safe_forward
+    sf_model.AudioFlow.sample_with_uncertainty = patched_sample_with_uncertainty
+
+
+def cycle(dl):
+    while True:
+        for data in dl:
+            yield data
+
+
+def _make_train_collate(base_collate, max_frames_per_spk, hop_size):
+    """Wraps dataset collate to randomly crop each waveform to max_frames_per_spk
+    before spectrogram computation.  This (a) exposes different overlap regions on
+    each pass through the data for clips longer than the crop window, and (b) prevents
+    large zero-padded tensors from being created and transferred to the GPU only to be
+    immediately discarded in the training loop."""
+    max_samples = max_frames_per_spk * hop_size
+
+    def collate_with_crop(batch):
+        cropped = []
+        for item in batch:
+            wav = item["wav"]        # [1, T]
+            tgt = item["targets"]    # [n_src, T]
+            T = wav.shape[-1]
+            if T > max_samples:
+                start = random.randint(0, T - max_samples)
+                wav = wav[:, start:start + max_samples]
+                tgt = tgt[:, start:start + max_samples]
+                item = {**item, "wav": wav, "targets": tgt}
+            cropped.append(item)
+        return base_collate(cropped)
+
+    return collate_with_crop
+
+
+def load_datasets(batch_size: int, val_cap: int = VAL_SAMPLES_PER_NSRC):
+    train_loaders: Dict[int, DataLoader] = {}
+    val_loaders:   Dict[int, DataLoader] = {}
+    for n in N_SRC_LIST:
+        setting = f"librittskor{n}"
+        ds_tr = make_dataset(setting=setting, cache_path="/tmp", subset="train")
+        ds_va = make_dataset(setting=setting, cache_path="/tmp", subset="dev")
+        if len(ds_va) > val_cap:
+            ds_va_use  = Subset(ds_va, list(range(val_cap)))
+            collate_fn = ds_va.collate
+        else:
+            ds_va_use  = ds_va
+            collate_fn = ds_va.collate
+        train_loaders[n] = DataLoader(
+            ds_tr, batch_size=batch_size, shuffle=True,
+            num_workers=TRAIN_LOADER_WORKERS,
+            collate_fn=_make_train_collate(ds_tr.collate, MAX_FRAMES_PER_SPK, config.audio.hop_size),
+            pin_memory=True,
+        )
+        val_loaders[n] = DataLoader(
+            ds_va_use, batch_size=batch_size, shuffle=False,
+            num_workers=2, collate_fn=collate_fn,
+        )
+        print(f"  n_src={n}: train={len(ds_tr)}  val={len(ds_va_use)}")
+    return train_loaders, val_loaders
+
+
+def _load_pretrained_backbone(backbone, path: Path):
+    ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
+    backbone_key = next((k for k in ("backbone", "backbone_frozen", "model") if k in ckpt), None)
+    if backbone_key:
+        raw_sd = ckpt[backbone_key]
+        if all(k.startswith("flow.") for k in raw_sd):
+            raw_sd = {k[len("flow."):]: v for k, v in raw_sd.items()}
+        backbone.load_state_dict(raw_sd)
+        print(f"  Backbone loaded from key '{backbone_key}' in {path.name}")
+    else:
+        print(f"[WARN] No recognised backbone key in {path.name}")
+    return backbone
+
+
+def eval_mel_sisnri(backbone, val_loaders: dict, device, n_eval: int = HP_SEARCH_EVAL_N) -> float:
+    backbone.eval()
+    sisnr_m      = ScaleInvariantSignalNoiseRatio().to(device)
+    total_sisnri = 0.0
+    n_total      = 0
+    T_cap        = 300
+
+    with torch.no_grad():
+        for n_src, val_loader in val_loaders.items():
+            val_iter = iter(val_loader)
+            for _ in range(min(n_eval, len(val_loader.dataset))):
+                try:
+                    condition_spec, flow_target, *_ = next(val_iter)
+                except StopIteration:
+                    break
+                cond = condition_spec[0:1].to(device)
+                tgt  = flow_target[0:1].to(device)
+                T    = min(cond.shape[1] // n_src, T_cap)
+                cond = cond[:, :T * n_src, :]
+                tgt  = tgt[:, :T * n_src, :]
+                norm_cond = (cond - config.audio.norm_mean) / config.audio.norm_std
+                norm_tgt  = (tgt  - config.audio.norm_mean) / config.audio.norm_std
+                z = torch.randn_like(norm_cond).to(device)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    for step_i in range(16):
+                        t_val = step_i / 16
+                        t_b   = torch.full((1,), t_val, device=device, dtype=torch.bfloat16)
+                        v     = backbone(audio=norm_cond.to(torch.bfloat16), noise=z.to(torch.bfloat16), times=t_b)
+                        z = z + v.float() * (1.0 / 16)
+                pred_slots = [z[0, s*T:(s+1)*T, :].flatten() for s in range(n_src)]
+                tgt_slots  = [norm_tgt[0, s*T:(s+1)*T, :].float().flatten() for s in range(n_src)]
+                mix_ref    = norm_cond[0, :T, :].float().flatten()
+                cost = np.zeros((n_src, n_src))
+                for pi in range(n_src):
+                    for ti in range(n_src):
+                        cost[pi, ti] = -sisnr_m(pred_slots[pi], tgt_slots[ti]).item()
+                pi_idx, ti_idx = linear_sum_assignment(cost)
+                for pi, ti in zip(pi_idx, ti_idx):
+                    total_sisnri += (sisnr_m(pred_slots[pi], tgt_slots[ti]).item() - sisnr_m(mix_ref, tgt_slots[ti]).item())
+                    n_total += 1
+
+    del sisnr_m
+    gc.collect()
+    torch.cuda.empty_cache()
+    return total_sisnri / max(1, n_total)
+
+
+def eval_mel_sisnri_stage2(
+    backbone, stno_proj, val_loaders: dict, device, n_eval: int = HP_SEARCH_EVAL_N
+) -> float:
+    """Stage-2 version of eval_mel_sisnri: applies oracle STNO conditioning so the
+    HP-search metric is consistent with how the backbone is actually trained in Stage 2.
+    Still operates in normalized-mel space (faster, no vocoder), so numbers will be
+    higher than waveform SI-SNRi, but HP rankings will be valid."""
+    backbone.eval()
+    if stno_proj is not None:
+        stno_proj.eval()
+    sisnr_m      = ScaleInvariantSignalNoiseRatio().to(device)
+    total_sisnri = 0.0
+    n_total      = 0
+    T_cap        = 300
+
+    with torch.no_grad():
+        for n_src, val_loader in val_loaders.items():
+            val_iter = iter(val_loader)
+            for _ in range(min(n_eval, len(val_loader.dataset))):
+                try:
+                    condition_spec, flow_target, *_ = next(val_iter)
+                except StopIteration:
+                    break
+                cond = condition_spec[0:1].to(device)
+                tgt  = flow_target[0:1].to(device)
+
+                if tgt.ndim == 4:
+                    T_single = min(tgt.shape[2], T_cap)
+                    tgt  = rearrange(tgt,  "b s t d -> b (s t) d")
+                    cond = torch.repeat_interleave(cond, repeats=n_src, dim=1)
+                else:
+                    T_single = min(cond.shape[1] // n_src, T_cap)
+
+                T_total = T_single * n_src
+                cond = cond[:, :T_total, :]
+                tgt  = tgt[:, :T_total, :]
+
+                # Oracle STNO — identical formulation to run_training Stage 2
+                d_st_total = (tgt.abs().sum(dim=-1) > 1e-4).float()
+                d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
+                p_S  = torch.prod(1.0 - d_st, dim=1, keepdim=True)
+                p_T_list, p_N_list, p_O_list = [], [], []
+                for s_k in range(n_src):
+                    d_sk  = d_st[:, s_k:s_k+1, :]
+                    mo    = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
+                    p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
+                    p_T_list.append(d_sk * p_oth)
+                    p_O_list.append(d_sk * (1.0 - p_oth))
+                    p_N_list.append((1.0 - p_S) - d_sk * p_oth - d_sk * (1.0 - p_oth))
+                p_T_flat = rearrange(torch.cat(p_T_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
+                p_N_flat = rearrange(torch.cat(p_N_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
+                p_O_flat = rearrange(torch.cat(p_O_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
+
+                norm_cond = (cond - config.audio.norm_mean) / config.audio.norm_std
+                norm_tgt  = (tgt  - config.audio.norm_mean) / config.audio.norm_std
+
+                stno_condition = None
+                if stno_proj is not None:
+                    slot_id = make_slot_id(1, n_src, T_single, device)
+                    stno_condition = stno_proj(
+                        p_T_flat.squeeze(-1), p_N_flat.squeeze(-1),
+                        p_O_flat.squeeze(-1), slot_id,
+                    )
+
+                z = torch.randn_like(norm_cond)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    for step_i in range(16):
+                        t_b = torch.full((1,), step_i / 16, device=device, dtype=torch.bfloat16)
+                        v   = backbone(
+                            audio=norm_cond.to(torch.bfloat16),
+                            noise=z.to(torch.bfloat16),
+                            times=t_b,
+                            condition=stno_condition,
+                        )
+                        z = z + v.float() * (1.0 / 16)
+
+                pred_slots = [z[0, s*T_single:(s+1)*T_single, :].flatten() for s in range(n_src)]
+                tgt_slots  = [norm_tgt[0, s*T_single:(s+1)*T_single, :].float().flatten() for s in range(n_src)]
+                mix_ref    = norm_cond[0, :T_single, :].float().flatten()
+
+                cost = np.zeros((n_src, n_src))
+                for pi in range(n_src):
+                    for ti in range(n_src):
+                        cost[pi, ti] = -sisnr_m(pred_slots[pi], tgt_slots[ti]).item()
+                pi_idx, ti_idx = linear_sum_assignment(cost)
+                for pi, ti in zip(pi_idx, ti_idx):
+                    total_sisnri += (
+                        sisnr_m(pred_slots[pi], tgt_slots[ti]).item()
+                        - sisnr_m(mix_ref,        tgt_slots[ti]).item()
+                    )
+                    n_total += 1
+
+    del sisnr_m
+    gc.collect()
+    torch.cuda.empty_cache()
+    if stno_proj is not None:
+        stno_proj.train()
+    return total_sisnri / max(1, n_total)
+
+
+def eval_waveform_sisnri_stage2(
+    backbone, stno_proj, val_loaders: dict, device, n_eval: int = HP_SEARCH_EVAL_N
+) -> float:
+    """Option B: true waveform SI-SNRi with oracle STNO conditioning.
+    Decodes model output through BigVSAN vocoder for accurate waveform-space metrics.
+    Falls back to eval_mel_sisnri_stage2 if vocoder is unavailable."""
+    vocoder = get_vocoder(device)
+    if vocoder is None:
+        print("[WARN] Vocoder unavailable — falling back to mel-SI-SNRi")
+        return eval_mel_sisnri_stage2(backbone, stno_proj, val_loaders, device, n_eval)
+
+    backbone.eval()
+    if stno_proj is not None:
+        stno_proj.eval()
+    sisnr_m      = ScaleInvariantSignalNoiseRatio().to(device)
+    total_sisnri = 0.0
+    n_total      = 0
+    T_cap        = 300
+
+    with torch.no_grad():
+        for n_src, val_loader in val_loaders.items():
+            val_iter = iter(val_loader)
+            for _ in range(min(n_eval, len(val_loader.dataset))):
+                try:
+                    condition_spec, flow_target, *_ = next(val_iter)
+                except StopIteration:
+                    break
+                cond = condition_spec[0:1].to(device)
+                tgt  = flow_target[0:1].to(device)
+
+                if tgt.ndim == 4:
+                    T_single = min(tgt.shape[2], T_cap)
+                    tgt  = rearrange(tgt,  "b s t d -> b (s t) d")
+                    cond = torch.repeat_interleave(cond, repeats=n_src, dim=1)
+                else:
+                    T_single = min(cond.shape[1] // n_src, T_cap)
+
+                T_total = T_single * n_src
+                cond = cond[:, :T_total, :]
+                tgt  = tgt[:, :T_total, :]
+
+                # Oracle STNO — identical to run_training Stage 2
+                d_st_total = (tgt.abs().sum(dim=-1) > 1e-4).float()
+                d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
+                p_S  = torch.prod(1.0 - d_st, dim=1, keepdim=True)
+                p_T_list, p_N_list, p_O_list = [], [], []
+                for s_k in range(n_src):
+                    d_sk  = d_st[:, s_k:s_k+1, :]
+                    mo    = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
+                    p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
+                    p_T_list.append(d_sk * p_oth)
+                    p_O_list.append(d_sk * (1.0 - p_oth))
+                    p_N_list.append((1.0 - p_S) - d_sk * p_oth - d_sk * (1.0 - p_oth))
+                p_T_flat = rearrange(torch.cat(p_T_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
+                p_N_flat = rearrange(torch.cat(p_N_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
+                p_O_flat = rearrange(torch.cat(p_O_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
+
+                norm_cond = (cond - config.audio.norm_mean) / config.audio.norm_std
+
+                stno_condition = None
+                if stno_proj is not None:
+                    slot_id = make_slot_id(1, n_src, T_single, device)
+                    stno_condition = stno_proj(
+                        p_T_flat.squeeze(-1), p_N_flat.squeeze(-1),
+                        p_O_flat.squeeze(-1), slot_id,
+                    )
+
+                z = torch.randn_like(norm_cond)
+                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                    for step_i in range(16):
+                        t_b = torch.full((1,), step_i / 16, device=device, dtype=torch.bfloat16)
+                        v   = backbone(
+                            audio=norm_cond.to(torch.bfloat16),
+                            noise=z.to(torch.bfloat16),
+                            times=t_b,
+                            condition=stno_condition,
+                        )
+                        z = z + v.float() * (1.0 / 16)
+
+                # Denormalize predicted mel and decode to waveform
+                pred_raw = z.float() * config.audio.norm_std + config.audio.norm_mean
+                pred_wavs = [do_vocoder(pred_raw[0, s*T_single:(s+1)*T_single, :], vocoder, device)
+                             for s in range(n_src)]
+                tgt_wavs  = [do_vocoder(tgt[0, s*T_single:(s+1)*T_single, :].float(), vocoder, device)
+                             for s in range(n_src)]
+                mix_wav   = do_vocoder(cond[0, :T_single, :].float(), vocoder, device)
+
+                min_len = min(min(w.shape[-1] for w in pred_wavs),
+                              min(w.shape[-1] for w in tgt_wavs), mix_wav.shape[-1])
+                pred_wavs = [w[:min_len] for w in pred_wavs]
+                tgt_wavs  = [w[:min_len] for w in tgt_wavs]
+                mix_wav   = mix_wav[:min_len]
+
+                cost = np.zeros((n_src, n_src))
+                for pi in range(n_src):
+                    for ti in range(n_src):
+                        cost[pi, ti] = -sisnr_m(pred_wavs[pi], tgt_wavs[ti]).item()
+                pi_idx, ti_idx = linear_sum_assignment(cost)
+                for pi, ti in zip(pi_idx, ti_idx):
+                    total_sisnri += (
+                        sisnr_m(pred_wavs[pi], tgt_wavs[ti]).item()
+                        - sisnr_m(mix_wav,     tgt_wavs[ti]).item()
+                    )
+                    n_total += 1
+
+    del sisnr_m
+    gc.collect()
+    torch.cuda.empty_cache()
+    if stno_proj is not None:
+        stno_proj.train()
+    return total_sisnri / max(1, n_total)
+
+
+# -----------------------------------------------------------------
+# Core training loop
+# -----------------------------------------------------------------
+def run_training(
+    stage: int, hp: Dict[str, Any], steps: int, eval_every: int, save_every: int,
+    train_loaders: dict, val_loaders: dict, device: torch.device,
+    experiment_name: str, save_path: Path, accelerator=None, trial=None,
+    full_eval: bool = False, pretrained_path: Optional[Path] = None, stage1_ckpt: Optional[Path] = None,
+) -> float:
+    try:
+        torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+    except AttributeError:
+        pass
+
+    backbone = AudioFlow(config).to(device)
+    uq_head  = UncertaintyHead(config).to(device)
+
+    init_path = pretrained_path or PRETRAINED_BACKBONE_PATH
+    if Path(init_path).exists():
+        _load_pretrained_backbone(backbone, Path(init_path))
+
+    if stage == 2 and stage1_ckpt and Path(stage1_ckpt).exists():
+        ckpt = torch.load(str(stage1_ckpt), map_location="cpu", weights_only=False)
+        backbone_key = next((k for k in ("backbone", "backbone_frozen", "model") if k in ckpt), None)
+        if backbone_key:
+            raw_sd = ckpt[backbone_key]
+            if all(k.startswith("flow.") for k in raw_sd):
+                raw_sd = {k[len("flow."):]: v for k, v in raw_sd.items()}
+            backbone.load_state_dict(raw_sd)
+            print(f"[Stage 2] Backbone loaded from {Path(stage1_ckpt).name} (will fine-tune at 0.1× LR)")
+        if "uq_head" in ckpt:
+            uq_head.load_state_dict(ckpt["uq_head"])
+
+    stno_proj = None
+    if stage == 1:
+        backbone.train()
+        uq_head.train()
+        print(f"Stage 1 backbone: {sum(p.numel() for p in backbone.parameters()):,}, "
+              f"UQ head: {sum(p.numel() for p in uq_head.parameters()):,}")
+    else:
+        backbone.train()
+        uq_head.train()
+        stno_proj = STNOProjection(config.model.n_dim).to(device)
+        stno_proj.train()
+        if stage1_ckpt:
+            ckpt_tmp = torch.load(str(stage1_ckpt), map_location="cpu", weights_only=False)
+            if "stno_proj" in ckpt_tmp:
+                stno_proj.load_state_dict(ckpt_tmp["stno_proj"])
+                print("[Stage 2] STNOProjection loaded from stage1 ckpt")
+        print(f"Stage 2 backbone: {sum(p.numel() for p in backbone.parameters()):,}, "
+              f"UQ head: {sum(p.numel() for p in uq_head.parameters()):,}, "
+              f"stno_proj: {sum(p.numel() for p in stno_proj.parameters()):,}")
+
+    lr_max       = hp["lr_max"]
+    lr_start     = hp.get("lr_start", lr_max * 0.01)
+    grad_accum   = hp.get("grad_accum", 2)
+    clip_norm    = hp.get("clip_norm", 0.2)
+    sigma        = hp.get("sigma", 1e-5)
+    warmup_steps = hp.get("warmup_steps", 3000)
+
+    if accelerator is not None:
+        lr_max   *= accelerator.num_processes
+        lr_start *= accelerator.num_processes
+
+    if stage == 1:
+        optim = torch.optim.AdamW(
+            [
+                {"params": list(backbone.parameters()), "lr": lr_max},
+                {"params": list(uq_head.parameters()),  "lr": lr_max},
+            ],
+            betas=[0.9, 0.99], weight_decay=0.01, eps=1e-7,
+        )
+    else:
+        optim = torch.optim.AdamW(
+            [
+                {"params": list(backbone.parameters()), "lr": lr_max * 0.5},
+                {"params": list(uq_head.parameters()), "lr": lr_max},
+                {"params": list(stno_proj.parameters()), "lr": lr_max * 0.5},
+            ],
+            betas=[0.9, 0.99], weight_decay=0.01, eps=1e-7,
+        )
+    _warmup = torch.optim.lr_scheduler.LinearLR(optim, start_factor=max(lr_start / lr_max, 1e-9), end_factor=1.0, total_iters=warmup_steps)
+    if stage == 2:
+        _plateau = None
+        _cosine  = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=max(steps - warmup_steps, 1), eta_min=lr_start)
+    else:
+        _plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="max", factor=0.5, patience=10, min_lr=lr_start * 10, threshold=0.1)
+        _cosine  = None
+
+    if accelerator is not None:
+        all_loaders = list(train_loaders.values())
+        if stno_proj is not None:
+            backbone, uq_head, stno_proj, optim, *prep = accelerator.prepare(backbone, uq_head, stno_proj, optim, *all_loaders)
+        else:
+            backbone, uq_head, optim, *prep = accelerator.prepare(backbone, uq_head, optim, *all_loaders)
+        train_loaders = {n: prep[i] for i, n in enumerate(N_SRC_LIST)}
+
+    train_cycles   = {n: cycle(ldr) for n, ldr in train_loaders.items()}
+    best_si_snri   = float("-inf")   # Stage 1
+    best_eval_loss = float("inf")    # Stage 2
+    no_improve_evals = 0             # early stopping counter (Stage 1 only)
+    warmup_done    = 0
+    step           = 0
+
+    if full_eval and save_path is not None:
+        for resume_name in [f"{experiment_name}.last.pt", f"{experiment_name}.pt"]:
+            resume_path = save_path / resume_name
+            if resume_path.exists():
+                print(f"Auto-resuming from {resume_path}")
+                ckpt = torch.load(str(resume_path), map_location="cpu", weights_only=False)
+                raw_bb = backbone if accelerator is None else accelerator.unwrap_model(backbone)
+                raw_uq = uq_head  if accelerator is None else accelerator.unwrap_model(uq_head)
+                raw_bb.load_state_dict(ckpt.get("backbone", raw_bb.state_dict()))
+                raw_uq.load_state_dict(ckpt.get("uq_head",  raw_uq.state_dict()))
+                if stno_proj is not None:
+                    raw_proj = accelerator.unwrap_model(stno_proj) if accelerator is not None else stno_proj
+                    raw_proj.load_state_dict(ckpt.get("stno_proj", raw_proj.state_dict()))
+                optim.load_state_dict(ckpt["optimizer"])
+                try:
+                    _warmup.load_state_dict(ckpt.get("scheduler", {}))
+                except Exception:
+                    pass
+                if "plateau" in ckpt and _plateau is not None:
+                    _plateau.load_state_dict(ckpt["plateau"])
+                # Do NOT load cosine state: accumulated scheduler bug caused last_epoch >> expected.
+                # Instead, reset optimizer LRs and create a fresh cosine for the remaining steps.
+                step           = ckpt.get("step", 0)
+                best_si_snri   = ckpt.get("best_si_snri",   float("-inf"))
+                best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
+                warmup_done    = min(step, warmup_steps)
+                if stage == 2 and step > 0:
+                    # Restore correct LRs (optimizer state has whatever corrupted LR was last set)
+                    init_lrs = [lr_max * 0.5, lr_max, lr_max * 0.5]
+                    for pg, new_lr in zip(optim.param_groups, init_lrs):
+                        pg["lr"] = new_lr
+                    remaining = max(steps - step, 1)
+                    _cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                        optim, T_max=remaining, eta_min=lr_start
+                    )
+                    print(f"  Reset cosine: fresh decay over {remaining} remaining steps, backbone_lr={init_lrs[0]:.2e}")
+                if stage == 2:
+                    print(f"  Resumed at step {step}, best eval_loss: {best_eval_loss:.4f}")
+                else:
+                    print(f"  Resumed at step {step}, best SI-SNRi: {best_si_snri:.2f} dB")
+                break
+
+    pbar = tqdm(initial=step, total=steps, desc=f"Stage {stage} [{experiment_name}]")
+
+    while step < steps:
+        backbone.train()
+        uq_head.train()
+        if stno_proj is not None:
+            stno_proj.train()
+
+        start = time.time()
+        last_predicted = None
+        last_vel_target = None
+        running_loss = 0.0
+        accum_done   = 0
+        optim.zero_grad()
+
+        while accum_done < grad_accum:
+            n_src = random.choice(N_SRC_LIST)
+
+            if accelerator is not None:
+                accum_ctx = accelerator.accumulate(backbone, uq_head)
+                cast_ctx  = accelerator.autocast()
+            else:
+                import contextlib
+                accum_ctx = contextlib.nullcontext()
+                cast_ctx  = torch.amp.autocast("cuda", dtype=torch.bfloat16)
+
+            with accum_ctx:
+                with cast_ctx:
+                    condition_spec, flow_target, batch_mix_paths, batch_src_paths = next(train_cycles[n_src])
+                    condition_spec = condition_spec.to(device)
+                    flow_target = flow_target.to(device)
+
+                    if flow_target.ndim == 4:
+                        T_single = flow_target.shape[2]
+                        flow_target_flat = rearrange(flow_target, "b s t d -> (b s) t d")
+                        condition_spec_flat = torch.repeat_interleave(condition_spec, repeats=n_src, dim=0)
+                    else:
+                        T_single = condition_spec.shape[1] // n_src
+                        flow_target_flat = flow_target
+                        condition_spec_flat = condition_spec
+
+                    if T_single > MAX_FRAMES_PER_SPK:
+                        T_single = MAX_FRAMES_PER_SPK
+                        
+                    T_total = T_single * n_src
+                    flow_target_flat = flow_target_flat[:, :T_total, :]
+                    condition_spec_flat = condition_spec_flat[:, :T_total, :]
+
+                    loss_mask = (flow_target_flat.abs().sum(dim=-1) > 1e-5)
+                    norm_cond   = (condition_spec_flat - config.audio.norm_mean) / config.audio.norm_std
+                    norm_target = (flow_target_flat    - config.audio.norm_mean) / config.audio.norm_std
+
+                    B_orig = norm_target.shape[0]
+                    times_raw = torch.rand(B_orig, dtype=condition_spec.dtype, device=device)
+                    t_bcast   = rearrange(times_raw, "b -> b 1 1").expand_as(norm_target)
+                    source_noise = torch.randn_like(norm_target)
+                    noise_state  = ((1.0 - (1.0 - sigma) * t_bcast) * source_noise + t_bcast * norm_target)
+                    vel_target = norm_target - (1.0 - sigma) * source_noise
+
+                    if stage == 1:
+                        # Entropy map: up-weight frames near speaker turn transitions
+                        with torch.no_grad():
+                            act = (flow_target_flat.abs().sum(dim=-1) > 1e-5).float()
+                            diff = torch.zeros_like(act)
+                            diff[:, 1:] = (act[:, 1:] - act[:, :-1]).abs()
+                            entropy_map = F.max_pool1d(
+                                diff.unsqueeze(1), kernel_size=15, stride=1, padding=7
+                            ).squeeze(1)
+                        loss_weight = loss_mask.float() * (1.0 + 1.0 * entropy_map)
+
+                        # Backbone: entropy-weighted PIT MSE
+                        predicted = backbone(audio=norm_cond, noise=noise_state, times=times_raw)
+                        bb_loss = pit_mse_loss(predicted, vel_target, n_src, mask=loss_weight)
+
+                        # UQ head: PIT NLL — detached backbone output keeps gradient paths clean
+                        pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw)
+                        pred_log_sigma = torch.clamp(pred_log_sigma, min=-2.0, max=2.0)
+                        nll_loss = pit_nll_loss(predicted.detach(), pred_log_sigma, vel_target, n_src, mask=loss_weight)
+
+                        loss = (bb_loss + 0.2 * nll_loss) / grad_accum
+                    # else:
+                    #     with torch.no_grad():
+                    #         raw_mask = (flow_target.abs().sum(dim=-1) > 1e-4).float()
+                    #         raw_mask = raw_mask[:, :, :T_single]
+                    #         diarization_mask = rearrange(raw_mask, "b s t -> b (s t)")
+                    #         diarization_mask = diarization_mask.unsqueeze(-1)
+
+                    #     # Condition (diarization mask) to encoder
+                    #     condition_spec_flat = condition_spec_flat * (1.0 + 0.1 * diarization_mask)
+                    #     # Update normalization and weights
+                    #     norm_cond = (condition_spec_flat - config.audio.norm_mean) / config.audio.norm_std
+
+                    #     # Model forward
+                    #     with torch.no_grad():
+                    #         pred_mean = backbone(audio=norm_cond, noise=noise_state, times=times_raw)
+                    #     pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw)
+                    #     pred_log_sigma = torch.clamp(pred_log_sigma, min=-8.0, max=4.0)
+                        
+                    #     # Detect where speakers changes
+                    #     with torch.no_grad():
+                    #         diff = torch.zeros_like(diarization_mask)
+                    #         diff[:, 1:, :] = torch.abs(diarization_mask[:, 1:, :] - diarization_mask[:, :-1, :])
+                    #         # Expand entropy Map
+                    #         entropy_map = F.max_pool1d(diff.transpose(1, 2), kernel_size=15, stride=1, padding=7).transpose(1, 2)
+                        
+                    #     # Loss Weight Map
+                    #     alpha_weight = 0.5
+                    #     loss_weight_mask = loss_mask.float() * (1.0 + alpha_weight * entropy_map.squeeze(-1))
+
+                    #     # Entropy-Weighted PIT NLL Loss
+                    #     loss = pit_nll_loss(pred_mean, pred_log_sigma, vel_target, n_src, loss_weight_mask)
+                    #     loss = loss / grad_accum
+                    
+                    else:
+                        # Compute oracle STNO mask from ground-truth activity
+                        with torch.no_grad():
+                            if flow_target.ndim == 4:
+                                d_st = (flow_target.abs().sum(dim=-1) > 1e-4).float()
+                                d_st = d_st[:, :, :T_single]
+                            else:
+                                d_st_total = (flow_target.abs().sum(dim=-1) > 1e-4).float()
+                                d_st_total = d_st_total[:, :n_src * T_single]
+                                d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
+
+                            p_S = torch.prod(1.0 - d_st, dim=1, keepdim=True)
+                            p_T_list, p_N_list, p_O_list = [], [], []
+                            for s_k in range(n_src):
+                                d_sk = d_st[:, s_k:s_k+1, :]
+                                mask_other = torch.ones_like(d_st)
+                                mask_other[:, s_k, :] = 0.0
+                                p_other = torch.prod(1.0 - (d_st * mask_other), dim=1, keepdim=True)
+                                p_T_sk = d_sk * p_other
+                                p_O_sk = d_sk * (1.0 - p_other)
+                                p_N_sk = (1.0 - p_S) - p_T_sk - p_O_sk
+                                p_T_list.append(p_T_sk)
+                                p_N_list.append(p_N_sk)
+                                p_O_list.append(p_O_sk)
+                            p_T = torch.cat(p_T_list, dim=1)
+                            p_N = torch.cat(p_N_list, dim=1)
+                            p_O = torch.cat(p_O_list, dim=1)
+                            p_T_flat = rearrange(p_T, "b s t -> b (s t)").unsqueeze(-1)
+                            p_N_flat = rearrange(p_N, "b s t -> b (s t)").unsqueeze(-1)
+                            p_O_flat = rearrange(p_O, "b s t -> b (s t)").unsqueeze(-1)
+
+                        # Normalize without input-space STNO; condition injected into hidden space below
+                        norm_cond = (condition_spec_flat - config.audio.norm_mean) / config.audio.norm_std
+
+                        # Project STNO features into backbone hidden space (B, T, n_dim).
+                        # Noise augmentation (σ=0.1) simulates PyAnnote frame errors so the model
+                        # doesn't overfit to perfect oracle masks.
+                        slot_id = make_slot_id(norm_cond.shape[0], n_src, T_single, device)
+                        _aug = 0.1
+                        p_T_aug = (p_T_flat.squeeze(-1) + torch.randn_like(p_T_flat.squeeze(-1)) * _aug).clamp(0, 1)
+                        p_N_aug = (p_N_flat.squeeze(-1) + torch.randn_like(p_N_flat.squeeze(-1)) * _aug).clamp(0, 1)
+                        p_O_aug = (p_O_flat.squeeze(-1) + torch.randn_like(p_O_flat.squeeze(-1)) * _aug).clamp(0, 1)
+                        stno_condition = stno_proj(p_T_aug, p_N_aug, p_O_aug, slot_id)
+
+                        # Direct MSE: STNO condition fixes permutation; no PIT needed
+                        pred_mean = backbone(audio=norm_cond, noise=noise_state, times=times_raw,
+                                             condition=stno_condition)
+
+                        # Entropy weight: up-weight speaker-transition frames where separation is hardest
+                        with torch.no_grad():
+                            diff = torch.zeros_like(p_T_flat)
+                            diff[:, 1:, :] = torch.abs(p_T_flat[:, 1:, :] - p_T_flat[:, :-1, :])
+                            entropy_map = F.max_pool1d(diff.transpose(1, 2), kernel_size=15, stride=1, padding=7).transpose(1, 2)
+                        loss_weight = loss_mask.float() * (1.0 + 1.0 * entropy_map.squeeze(-1))
+
+                        loss_per_frame = F.mse_loss(pred_mean.float(), vel_target.float(), reduction='none').mean(dim=-1)
+                        nvalid = loss_weight.sum().clamp(min=1)
+                        bb_loss = (loss_per_frame * loss_weight).sum() / nvalid
+
+                        # UQ head: NLL trains on its own parameters only.
+                        # stno_condition is detached so nll gradients cannot conflict with bb_loss
+                        # gradients inside stno_proj — both objectives now have clean gradient paths.
+                        pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw,
+                                                 condition=stno_condition.detach())
+                        pred_log_sigma = torch.clamp(pred_log_sigma, min=-2.0, max=2.0)
+                        var_slots = torch.exp(2.0 * pred_log_sigma)
+                        error_sq = (pred_mean.detach() - vel_target) ** 2
+                        nll_map = error_sq / (2.0 * var_slots) + pred_log_sigma
+                        nll_loss = (nll_map.mean(dim=-1) * loss_weight).sum() / nvalid
+
+                        loss = (bb_loss + 0.2 * nll_loss) / grad_accum
+                        
+                    if accelerator is not None:
+                        accelerator.backward(loss)
+                    else:
+                        loss.backward()
+                    loss_val = loss.item() * grad_accum
+
+                    # Capture stats from first micro-batch for logging
+                    if last_predicted is None:
+                        _p = predicted if stage == 1 else pred_mean
+                        last_predicted = _p.detach().float().cpu()
+                        last_vel_target = vel_target.detach().float().cpu()
+
+                sync = accelerator.sync_gradients if accelerator is not None else True
+                if sync:
+                    params_to_clip = (
+                        list(backbone.parameters()) + list(uq_head.parameters()) +
+                        (list(stno_proj.parameters()) if stno_proj is not None else [])
+                    )
+                    if accelerator is not None:
+                        accelerator.clip_grad_norm_(params_to_clip, clip_norm)
+                    else:
+                        torch.nn.utils.clip_grad_norm_(params_to_clip, clip_norm)
+                    optim.step()
+                    warmup_done += 1
+                    if warmup_done <= warmup_steps:
+                        _warmup.step()
+                    elif _cosine is not None:
+                        _cosine.step()
+                    optim.zero_grad()
+                    running_loss += loss_val
+                    accum_done   += 1
+
+        end = time.time()
+        step += 1
+        pbar.update(1)
+        cur_lr = optim.param_groups[0]["lr"]
+        pbar.set_postfix(
+            loss=f"{running_loss / grad_accum:.4f}",
+            lr=f"{cur_lr:.2e}",
+            step_s=f"{end - start:.2f}s",
+        )
+
+        if full_eval and accelerator is not None and accelerator.is_main_process:
+            log_dict = {
+                "train_loss": running_loss / grad_accum,
+                "learning_rate": cur_lr,
+            }
+            if last_predicted is not None:
+                log_dict.update({
+                    "predicted/mean": last_predicted.mean().item(),
+                    "predicted/max":  last_predicted.max().item(),
+                    "predicted/min":  last_predicted.min().item(),
+                    "target/mean":    last_vel_target.mean().item(),
+                    "target/max":     last_vel_target.max().item(),
+                    "target/min":     last_vel_target.min().item(),
+                })
+            accelerator.log(log_dict, step=step)
+
+        if step % eval_every == 0:
+            raw_bb   = backbone   if accelerator is None else accelerator.unwrap_model(backbone)
+            raw_uq   = uq_head    if accelerator is None else accelerator.unwrap_model(uq_head)
+            raw_proj = stno_proj  if accelerator is None else (accelerator.unwrap_model(stno_proj) if stno_proj is not None else None)
+
+            if full_eval and accelerator is not None:
+                eval_stats = compute_eval_stats(raw_bb, val_loaders, device, sigma=sigma, n_per_nsrc=20, stno_proj=raw_proj)
+                cur_loss   = eval_stats["eval_loss"]
+
+                if accelerator.is_main_process:
+                    accelerator.log(eval_stats, step=step)
+
+                    # if stage == 2:
+                        # if cur_loss < best_eval_loss:
+                        #     best_eval_loss = cur_loss
+                        #     best_path = save_path / f"{experiment_name}.best.pt"
+                        #     torch.save({
+                        #         "backbone":        raw_bb.state_dict(),
+                        #         "uq_head":         raw_uq.state_dict(),
+                        #         "stno_proj":       raw_proj.state_dict() if raw_proj is not None else {},
+                        #         "step":            step,
+                        #         "best_eval_loss":  float(best_eval_loss),
+                        #         "optimizer":       optim.state_dict(),
+                        #         "cosine":          _cosine.state_dict() if _cosine is not None else {},
+                        #     }, str(best_path), _use_new_zipfile_serialization=False)
+                        #     accelerator.print(f"[BEST] eval_loss={best_eval_loss:.4f} at step {step} -> {best_path}")
+
+                    # RC2 fix: branch by stage so Stage 1 uses mel-SI-SNRi (consistent with HP search),
+                    # not eval_waveform_sisnri_stage2 which was wrongly called for all stages.
+                    # was: si_snri = eval_waveform_sisnri_stage2(raw_bb, raw_proj, val_loaders, device, n_eval=10)
+                    if stage == 2:
+                        si_snri = eval_waveform_sisnri_stage2(raw_bb, raw_proj, val_loaders, device, n_eval=10)
+                        pbar.write(f"Step {step}: eval_loss={cur_loss:.4f}  SI-SNRi(wave)={si_snri:.2f} dB")
+                    else:
+                        si_snri = eval_mel_sisnri(raw_bb, val_loaders, device, n_eval=100)
+                        pbar.write(f"Step {step}: eval_loss={cur_loss:.4f}  mel-SI-SNRi={si_snri:.2f} dB")
+                    accelerator.log({"val/si_snri": si_snri}, step=step)
+
+                    prev_best = best_si_snri
+                    if si_snri > best_si_snri:
+                        best_si_snri = si_snri
+                        best_path = save_path / f"{experiment_name}.best.pt"
+                        torch.save({
+                            "backbone":        raw_bb.state_dict(),
+                            "uq_head":         raw_uq.state_dict(),
+                            "stno_proj":       raw_proj.state_dict() if raw_proj is not None else {},
+                            "step":            step,
+                            "best_si_snri":    float(best_si_snri),
+                            "best_eval_loss":  float(best_eval_loss),
+                            "optimizer":       optim.state_dict(),
+                            "scheduler":       _warmup.state_dict(),
+                            "cosine":          _cosine.state_dict() if _cosine is not None else {},
+                            "plateau":         _plateau.state_dict() if _plateau is not None else {},
+                            "hp":              hp,
+                        }, str(best_path), _use_new_zipfile_serialization=False)
+                        accelerator.print(f"[BEST] SI-SNRi={best_si_snri:.2f} dB at step {step} -> {best_path}")
+
+                    # RC3+RC4 fix: step plateau with actual SI-SNRi (Stage 1 only; _plateau is None for Stage 2)
+                    if _plateau is not None:
+                        _plateau.step(si_snri)
+
+                    # Early stopping (Stage 1 full-training only)
+                    if stage == 1 and full_eval:
+                        if si_snri >= prev_best + EARLY_STOP_MIN_DELTA_DB:
+                            no_improve_evals = 0
+                        else:
+                            no_improve_evals += 1
+                            accelerator.print(
+                                f"[ES] No ≥{EARLY_STOP_MIN_DELTA_DB} dB gain: "
+                                f"{no_improve_evals}/{EARLY_STOP_PATIENCE_EVALS}"
+                            )
+                            if no_improve_evals >= EARLY_STOP_PATIENCE_EVALS:
+                                accelerator.print(
+                                    f"[EARLY STOP] Triggered at step {step} — "
+                                    f"no substantial gain for {EARLY_STOP_PATIENCE_EVALS} evals. "
+                                    f"Best: {best_si_snri:.2f} dB. Use .best.pt checkpoint."
+                                )
+                                pbar.close()
+                                return best_si_snri
+
+                    last_path = save_path / f"{experiment_name}.last.pt"
+                    torch.save({
+                        "backbone":        raw_bb.state_dict(),
+                        "uq_head":         raw_uq.state_dict(),
+                        "stno_proj":       raw_proj.state_dict() if raw_proj is not None else {},
+                        "step":            step,
+                        "best_si_snri":    float(best_si_snri),
+                        "best_eval_loss":  float(best_eval_loss),
+                        "optimizer":       optim.state_dict(),
+                        "scheduler":       _warmup.state_dict(),
+                        "cosine":          _cosine.state_dict() if _cosine is not None else {},
+                        "plateau":         _plateau.state_dict() if _plateau is not None else {},
+                        "hp":              hp,
+                    }, str(last_path), _use_new_zipfile_serialization=False)
+                    pbar.write(f"Step {step}: SI-SNRi={si_snri:.2f} dB  eval_loss={cur_loss:.4f}")
+                    accelerator.print(f"[LAST] Step {step} -> {last_path}")
+
+            else:
+                if stage == 2 and raw_proj is not None:
+                    si_snri = eval_waveform_sisnri_stage2(raw_bb, raw_proj, val_loaders, device)
+                else:
+                    si_snri = eval_mel_sisnri(raw_bb, val_loaders, device)
+                print(f"  [step {step}/{steps}] SI-SNRi={si_snri:.2f} dB  loss={running_loss / grad_accum:.4f}  lr={optim.param_groups[0]['lr']:.2e}")
+                if _plateau is not None:
+                    _plateau.step(si_snri)
+
+                if si_snri > best_si_snri:
+                    best_si_snri = si_snri
+                    if save_path is not None:
+                        best_path = Path(save_path) / f"{experiment_name}.best.pt"
+                        torch.save({
+                            "backbone":     raw_bb.state_dict(),
+                            "uq_head":      raw_uq.state_dict(),
+                            "stno_proj":    raw_proj.state_dict() if raw_proj is not None else {},
+                            "step":         step,
+                            "best_si_snri": float(best_si_snri),
+                            "optimizer":    optim.state_dict(),
+                        }, str(best_path), _use_new_zipfile_serialization=False)
+                        print(f"[BEST] mel-SI-SNRi={best_si_snri:.2f} dB -> {best_path}")
+
+            if trial is not None:
+                trial_val = si_snri  # mel-SI-SNRi for both stages (with STNO for stage 2)
+                trial.report(trial_val, step)
+                if trial.should_prune():
+                    pbar.close()
+                    raise optuna.exceptions.TrialPruned()
+
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # Storage fix: removed step-based checkpoint saves — only .last.pt (every eval) and .best.pt survive
+        # was: _save_now = (step in save_every) if isinstance(save_every, (list, tuple)) else (step % save_every == 0)
+        # was: if (full_eval and save_path is not None and _save_now and (accelerator is None or accelerator.is_main_process)):
+        #     raw_bb   = backbone  if accelerator is None else accelerator.unwrap_model(backbone)
+        #     raw_uq   = uq_head   if accelerator is None else accelerator.unwrap_model(uq_head)
+        #     raw_proj = stno_proj if accelerator is None else (accelerator.unwrap_model(stno_proj) if stno_proj is not None else None)
+        #     fname  = str(save_path / f"{experiment_name}.{step}.pt")
+        #     payload = {
+        #         "backbone":     raw_bb.state_dict(),
+        #         "uq_head":      raw_uq.state_dict(),
+        #         "stno_proj":    raw_proj.state_dict() if raw_proj is not None else {},
+        #         "step":         step,
+        #         "best_si_snri":   float(best_si_snri),
+        #         "best_eval_loss": float(best_eval_loss),
+        #         "optimizer":      optim.state_dict(),
+        #         "scheduler":      _warmup.state_dict(),
+        #         "cosine":         _cosine.state_dict() if _cosine is not None else {},
+        #         "plateau":        _plateau.state_dict() if _plateau is not None else {},
+        #         "hp":             hp,
+        #     }
+        #     torch.save(payload, fname, _use_new_zipfile_serialization=False)
+        #     shutil.copyfile(fname, str(save_path / f"{experiment_name}.pt"))
+        #     pbar.write(f"Step {step}: checkpoint saved")
+        #     print(f"[SAVE] {fname}")
+
+        torch.cuda.empty_cache()
+
+    pbar.close()
+    # return -best_eval_loss if stage == 2 else best_si_snri
+    # Both stages: return mel-SI-SNRi (maximize). For stage 2 full_eval, best_si_snri
+    # tracks the STNO-conditioned mel-SI-SNRi; best_eval_loss is also saved separately.
+    return best_si_snri
+
+
+def search_stage1(train_loaders: dict, val_loaders: dict, device: torch.device) -> Dict[str, Any]:
+    def objective(trial: optuna.Trial) -> float:
+        hp = {
+            "lr_max":       trial.suggest_float("lr_max",       1e-7, 1e-4, log=True),
+            "lr_start":     trial.suggest_float("lr_start",     1e-9, 1e-6, log=True),
+            "warmup_steps": trial.suggest_int  ("warmup_steps", 500,  5000),
+            "clip_norm":    trial.suggest_float("clip_norm",    0.05, 2.0,  log=True),
+            "sigma":        trial.suggest_float("sigma",        1e-6, 1e-3, log=True),
+            "batch_size":   4,
+            "grad_accum":   trial.suggest_categorical("grad_accum", [2, 4]),
+        }
+        trial_save = HP_SEARCH_PATH / f"stage1_trial{trial.number}"
+        os.makedirs(trial_save, exist_ok=True)
+        try:
+            return run_training(
+                stage=1, hp=hp, steps=STAGE1_SEARCH_STEPS, eval_every=STAGE1_SEARCH_EVAL_EVERY,
+                save_every=STAGE1_SEARCH_STEPS + 1, train_loaders=train_loaders, val_loaders=val_loaders, device=device,
+                experiment_name=f"trial_{trial.number}", save_path=trial_save, trial=trial, full_eval=False,
+            )
+        except optuna.exceptions.TrialPruned:
+            raise
+        except Exception as e:
+            print(f"[Trial {trial.number}] FAILED: {e}")
+            return float("-inf")
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    study = optuna.create_study(
+        study_name="stage1_hp_search_libri", direction="maximize", sampler=TPESampler(seed=42),
+        pruner=MedianPruner(n_startup_trials=5, n_warmup_steps=STAGE1_SEARCH_EVAL_EVERY),
+        storage=OPTUNA_DB, load_if_exists=True,
+    )
+    study.enqueue_trial({k: v for k, v in MANUAL_STAGE1_HP.items() if k != "batch_size"})
+    remaining = max(0, STAGE1_N_TRIALS - len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]))
+    if remaining > 0:
+        study.optimize(objective, n_trials=remaining, show_progress_bar=True)
+    best_trial = study.best_trial
+    print(f"\n[Stage 1 Search] Best trial #{best_trial.number}: mel-SI-SNRi={best_trial.value:.2f} dB")
+    best_hp = dict(best_trial.params)
+    best_hp["batch_size"] = 4
+    return best_hp
+
+
+def search_stage2(train_loaders: dict, val_loaders: dict, device: torch.device, stage1_best: Path) -> Dict[str, Any]:
+    def objective(trial: optuna.Trial) -> float:
+        hp = {
+            "lr_max":       trial.suggest_float("lr_max",       1e-7, 1e-4, log=True),
+            "lr_start":     trial.suggest_float("lr_start",     1e-9, 1e-6, log=True),
+            "warmup_steps": trial.suggest_int  ("warmup_steps", 100,  1000),
+            "clip_norm":    trial.suggest_float("clip_norm",    0.05, 2.0,  log=True),
+            "sigma":        trial.suggest_float("sigma",        1e-6, 1e-3, log=True),
+            "batch_size":   4,
+            "grad_accum":   trial.suggest_categorical("grad_accum", [2, 4]),
+        }
+        trial_save = HP_SEARCH_PATH / f"stage2_trial{trial.number}"
+        os.makedirs(trial_save, exist_ok=True)
+        try:
+            return run_training(
+                stage=2, hp=hp, steps=STAGE2_SEARCH_STEPS, eval_every=STAGE2_SEARCH_EVAL_EVERY,
+                save_every=STAGE2_SEARCH_STEPS + 1, train_loaders=train_loaders, val_loaders=val_loaders, device=device,
+                experiment_name=f"s2_trial_{trial.number}", save_path=trial_save, trial=trial, full_eval=False, stage1_ckpt=stage1_best,
+            )
+        except optuna.exceptions.TrialPruned:
+            raise
+        except Exception as e:
+            print(f"[S2 Trial {trial.number}] FAILED: {e}")
+            return float("-inf")
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    study = optuna.create_study(
+        study_name="stage2_hp_search_libri", direction="maximize", sampler=TPESampler(seed=42),
+        pruner=MedianPruner(n_startup_trials=3, n_warmup_steps=STAGE2_SEARCH_EVAL_EVERY),
+        storage=OPTUNA_DB, load_if_exists=True,
+    )
+    study.enqueue_trial({k: v for k, v in MANUAL_STAGE2_HP.items() if k != "batch_size"})
+    remaining = max(0, STAGE2_N_TRIALS - len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]))
+    if remaining > 0:
+        study.optimize(objective, n_trials=remaining, show_progress_bar=True)
+    best_trial = study.best_trial
+    print(f"\n[Stage 2 Search] Best trial #{best_trial.number}: SI-SNRi(wave)={best_trial.value:.2f} dB")
+    best_hp = dict(best_trial.params)
+    best_hp["batch_size"] = 4
+    return best_hp
+
+
+def main():
+    try:
+        torch.serialization.add_safe_globals([np.core.multiarray.scalar])
+    except AttributeError:
+        pass
+
+    apply_training_patches()
+
+    ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs], mixed_precision=TRAIN_MIXED_PRECISION)
+    device = accelerator.device
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    accelerator.print("Loading datasets...")
+    train_loaders, val_loaders = load_datasets(batch_size=4)
+
+    # # -- Stage 1 --
+    if HP_SEARCH_MODE:
+        accelerator.print("\n" + "=" * 60)
+        accelerator.print("Stage 1 HP search")
+        accelerator.print("=" * 60)
+        best_s1_hp = search_stage1(train_loaders, val_loaders, device)
+        accelerator.print(f"\nBest Stage 1 HPs: {best_s1_hp}")
+    else:
+        best_s1_hp = MANUAL_STAGE1_HP
+        accelerator.print(f"\nUsing manual Stage 1 HPs: {best_s1_hp}")
+
+    accelerator.print("\n" + "=" * 60)
+    accelerator.print("Stage 1 full training")
+    accelerator.print("=" * 60)
+    accelerator.init_trackers(train_project, config={"stage": 1, **best_s1_hp})
+    run_training(
+        stage=1, hp=best_s1_hp, steps=STAGE1_FULL_STEPS, eval_every=STAGE1_FULL_EVAL_EV, save_every=STAGE1_FULL_SAVE_EV,
+        train_loaders=train_loaders, val_loaders=val_loaders, device=device,
+        experiment_name=STAGE1_EXPERIMENT, save_path=STAGE1_SAVE_PATH, accelerator=accelerator, full_eval=True, pretrained_path=PRETRAINED_BACKBONE_PATH,
+    )
+    accelerator.end_training()
+    accelerator.print("\nStage 1 complete!")
+
+    # -- Stage 2 --
+    stage1_best = STAGE1_SAVE_PATH / f"{STAGE1_EXPERIMENT}.best.pt"
+    # stage1_best = STAGE1_SAVE_PATH / f"{STAGE1_EXPERIMENT}.47500.pt"
+
+    if HP_SEARCH_MODE:
+        accelerator.print("\n" + "=" * 60)
+        accelerator.print("Stage 2 HP search")
+        accelerator.print("=" * 60)
+        best_s2_hp = search_stage2(train_loaders, val_loaders, device, stage1_best)
+        accelerator.print(f"\nBest Stage 2 HPs: {best_s2_hp}")
+    else:
+        best_s2_hp = MANUAL_STAGE2_HP
+        accelerator.print(f"\nUsing manual Stage 2 HPs: {best_s2_hp}")
+
+    ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=True)
+    _ga = best_s2_hp.get("grad_accum", 1)
+    accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs], mixed_precision=TRAIN_MIXED_PRECISION,
+                              gradient_accumulation_steps=_ga)
+    device = accelerator.device
+    accelerator.print("\n" + "=" * 60)
+    accelerator.print("Stage 2 full training")
+    accelerator.print("=" * 60)
+    accelerator.init_trackers(train_project, config={"stage": 2, **best_s2_hp})
+    run_training(
+        stage=2, hp=best_s2_hp, steps=STAGE2_FULL_STEPS, eval_every=STAGE2_FULL_EVAL_EV, save_every=STAGE2_FULL_SAVE_EV,
+        train_loaders=train_loaders, val_loaders=val_loaders, device=device,
+        experiment_name=STAGE2_EXPERIMENT, save_path=STAGE2_SAVE_PATH, accelerator=accelerator, full_eval=True, stage1_ckpt=stage1_best,
+    )
+    accelerator.end_training()
+    accelerator.print("\nStage 2 complete!")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.env
+
+# Model checkpoints / weights
+*.pt
+*.pth
+*.ckpt
+
+# Logs and experiment outputs
+*.log
+wandb/
+results/
+logs/
+output/
+
+# Figures / audio / serialized metrics (not tracked; regenerate from code)
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.wav
+*.flac
+*.json
+
+# Datasets
+datasets/
+external_datasets/
+.mfa

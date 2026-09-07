@@ -1,0 +1,17 @@
+# Core dependencies for MouSSe (pinned to the versions used for the paper).
+torch==2.8.0
+torchaudio==2.8.0
+torchmetrics==1.9.0
+torchdiffeq==0.2.5
+numpy==2.4.6
+scipy==1.17.1
+einops==0.8.2
+accelerate==1.13.0
+optuna==4.9.0
+wandb==0.27.0
+tqdm==4.67.3
+
+# The waveform-domain evaluation metrics (STOI/PESQ/SI-SDR) synthesise audio
+# with an external vocoder loaded at runtime via torch.hub:
+#     torch.hub.load("ex3ndr/supervoice-vocoder", "bigvsan")
+# No pip install is required for it, but network access is needed on first use.
