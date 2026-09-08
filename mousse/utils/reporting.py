@@ -194,43 +194,20 @@ def _categorize(meta):
 
 # ─── Formatting ───────────────────────────────────────────────────────────────
 def _fmt_metrics(acc):
-    sd_vo     = _avg(acc, "sisdri_vo")
-    sd_out_vo = _avg(acc, "si_sdr_out_vo")
-    sd_mix_vo = _avg(acc, "si_sdr_mix_vo")
-    et        = _avg(acc, "estoi")
-    eti       = _avg(acc, "estoii")
-    si        = _avg(acc, "sisnri")
-    si_out    = _avg(acc, "si_snr_out")
-    si_mix    = _avg(acc, "si_snr_mix")
-    dr_vo     = _avg(acc, "sdri_vo")
-    nr_vo     = _avg(acc, "snri_vo")
-    sd_or     = _avg(acc, "sisdri_orig")
-    dr_or     = _avg(acc, "sdri_orig")
-    st        = _avg(acc, "stoi")
-    sti       = _avg(acc, "stoii")
-    pe        = _avg(acc, "pesq")
-    pei       = _avg(acc, "pesqi")
-    du        = _avg(acc, "dur")
-    uq        = _avg(acc, "uq")
-    uq_act    = _avg(acc, "uq_active")
-    st_or     = _avg(acc, "stoi_orig")
-    sti_or    = _avg(acc, "stoii_orig")
-    et_or     = _avg(acc, "estoi_orig")
-    eti_or    = _avg(acc, "estoii_orig")
-    pe_or     = _avg(acc, "pesq_orig")
+    # Paper metrics: improvement over mixture baseline, vs vocoded target.
+    dr_vo  = _avg(acc, "sdri_vo")     # SDRi
+    sd_vo  = _avg(acc, "sisdri_vo")   # SI-SDRi
+    sti    = _avg(acc, "stoii")       # STOIi
+    eti    = _avg(acc, "estoii")      # ESTOIi
+    pei    = _avg(acc, "pesqi")       # PESQi
+    uq     = _avg(acc, "uq")
+    uq_act = _avg(acc, "uq_active")
     def _f2(v): return f"{v:6.2f}" if not math.isnan(v) else "  N/A "
     def _f4(v): return f"{v:.4f}"  if not math.isnan(v) else "  N/A"
     def _f6(v): return f"{v:.6f}"  if not math.isnan(v) else "  N/A"
     return (
-        f"SI-SDRi(vo)={_f2(sd_vo)} dB  SI-SDR_out(vo)={_f2(sd_out_vo)} dB  SI-SDR_mix(vo)={_f2(sd_mix_vo)} dB  "
-        f"ESTOi={_f4(et)}  ESTOii={_f4(eti)}  "
-        f"SI-SNRi={_f2(si)} dB  SI-SNR_out={_f2(si_out)} dB  SI-SNR_mix={_f2(si_mix)} dB  "
-        f"SDRi(vo)={_f2(dr_vo)} dB  SNRi(vo)={_f2(nr_vo)} dB  "
-        f"SI-SDRi(orig)={_f2(sd_or)} dB  SDRi(orig)={_f2(dr_or)} dB  "
-        f"STOI={_f4(st)}  STOIi={_f4(sti)}  ESTOI={_f4(et)}  ESTOIi={_f4(eti)}  "
-        f"PESQ={_f4(pe)}  PESQi={_f4(pei)}  Dur={_f4(du)} s  "
-        f"STOI(orig)={_f4(st_or)}  STOIi(orig)={_f4(sti_or)}  "
-        f"ESTOI(orig)={_f4(et_or)}  ESTOIi(orig)={_f4(eti_or)}  PESQ(orig)={_f4(pe_or)}  "
+        f"SDRi(vo)={_f2(dr_vo)} dB  SI-SDRi(vo)={_f2(sd_vo)} dB  "
+        f"STOIi={_f4(sti)}  ESTOIi={_f4(eti)}  PESQi={_f4(pei)}  "
         f"UQ(sigma)={_f6(uq)}  UQ(sigma_active)={_f6(uq_act)}"
     )
 
@@ -240,9 +217,7 @@ def _fmt_cell(acc, metric):
     val = _avg(acc, metric)
     if math.isnan(val):
         return f"{'N/A':>11}"
-    if metric in ("sisnri", "si_snr_out", "si_snr_mix",
-                  "sisdri_vo", "si_sdr_out_vo", "si_sdr_mix_vo",
-                  "sdri_vo", "snri_vo", "sisdri_orig", "sdri_orig", "dur"):
+    if metric in ("sdri_vo", "sisdri_vo"):  # dB-valued metrics
         return f"{val:11.2f}"
     return f"{val:11.4f}"
 
@@ -299,32 +274,15 @@ def _print_category_summary(nsrc_acc, cat_acc, n_src_list):
 def _print_cross_table(cat_acc, n_src_list):
     """Print cross-tables (one per metric)."""
     METRICS = [
-        # Primary metrics (baseline-corrected, waveform domain)
-        ("sisdri_vo",     "SI-SDRi (dB) [wav, improvement over mixture baseline]"),
-        ("si_sdr_out_vo", "SI-SDR_out (dB) [wav, absolute — baseline-free comparison]"),
-        ("si_sdr_mix_vo", "SI-SDR_mix (dB) [wav, mixture baseline — shows n_src inflation]"),
-        ("estoi",         "ESTOi [Extended STOI, absolute]"),
-        ("estoii",        "ESTOii [Extended STOI improvement over mixture baseline]"),
-        # Secondary metrics
-        ("sisnri",        "SI-SNRi (dB) [mel, improvement over mixture]"),
-        ("si_snr_out",    "SI-SNR_out (dB) [mel, absolute — baseline-free comparison]"),
-        ("si_snr_mix",    "SI-SNR_mix (dB) [mel, mixture baseline — shows n_src inflation]"),
-        ("sdri_vo",       "SDRi (dB) [wav, vs vocoded target]"),
-        ("snri_vo",       "SNRi (dB) [wav, vs vocoded target]"),
-        ("sisdri_orig",   "SI-SDRi (dB) [wav, vs original target]"),
-        ("sdri_orig",     "SDRi (dB) [wav, vs original target]"),
-        ("stoi",          "STOI [absolute, vs vocoded target]"),
-        ("stoii",         "STOIi [STOI improvement over mixture baseline, vs vocoded target]"),
-        ("pesq",          "PESQ [vs vocoded target]"),
-        ("pesqi",         "PESQi [PESQ improvement over mixture baseline, vs vocoded target]"),
-        ("stoi_orig",     "STOI [absolute, vs original wav — paper-standard]"),
-        ("stoii_orig",    "STOIi [improvement, vs original wav]"),
-        ("estoi_orig",    "ESTOI [absolute, vs original wav — paper-standard]"),
-        ("estoii_orig",   "ESTOIi [improvement, vs original wav]"),
-        ("pesq_orig",     "PESQ [vs original wav — paper-standard]"),
-        ("dur",           "Speech Duration (s)"),
-        ("uq",            "UQ sigma_cond (mean over all frames, per slot)"),
-        ("uq_active",     "UQ sigma_active (mean over active-speech frames only)"),
+        # Paper metrics: improvement over mixture baseline, vs vocoded target.
+        ("sdri_vo",   "SDRi (dB) [wav, improvement over mixture baseline]"),
+        ("sisdri_vo", "SI-SDRi (dB) [wav, improvement over mixture baseline]"),
+        ("stoii",     "STOIi [STOI improvement over mixture baseline]"),
+        ("estoii",    "ESTOIi [Extended STOI improvement over mixture baseline]"),
+        ("pesqi",     "PESQi [PESQ improvement over mixture baseline]"),
+        # Model uncertainty (not a separation-quality metric)
+        ("uq",        "UQ sigma_cond (mean over all frames, per slot)"),
+        ("uq_active", "UQ sigma_active (mean over active-speech frames only)"),
     ]
 
     HDR0 = (
@@ -367,28 +325,13 @@ def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
     def _acc_to_dict(acc):
         return {
             "n_samples": acc["n_samples"],
-            "si_sdri_vo":      _jv(_avg(acc, "sisdri_vo")),    "n_sisdri_vo":    acc["n_sisdri_vo"],
-            "si_sdr_out_vo":   _jv(_avg(acc, "si_sdr_out_vo")),"n_si_sdr_out_vo":acc["n_si_sdr_out_vo"],
-            "si_sdr_mix_vo":   _jv(_avg(acc, "si_sdr_mix_vo")),"n_si_sdr_mix_vo":acc["n_si_sdr_mix_vo"],
-            "estoi":           _jv(_avg(acc, "estoi")),          "n_estoi":        acc["n_estoi"],
-            "estoii":          _jv(_avg(acc, "estoii")),         "n_estoii":       acc["n_estoii"],
-            "si_snri":         _jv(_avg(acc, "sisnri")),        "n_sisnri":       acc["n_sisnri"],
-            "si_snr_out":      _jv(_avg(acc, "si_snr_out")),    "n_si_snr_out":   acc["n_si_snr_out"],
-            "si_snr_mix":      _jv(_avg(acc, "si_snr_mix")),    "n_si_snr_mix":   acc["n_si_snr_mix"],
+            # Paper metrics: improvement over mixture baseline, vs vocoded target.
             "sdri_vo":         _jv(_avg(acc, "sdri_vo")),        "n_sdri_vo":      acc["n_sdri_vo"],
-            "snri_vo":         _jv(_avg(acc, "snri_vo")),        "n_snri_vo":      acc["n_snri_vo"],
-            "si_sdri_orig":    _jv(_avg(acc, "sisdri_orig")),   "n_sisdri_orig":  acc["n_sisdri_orig"],
-            "sdri_orig":       _jv(_avg(acc, "sdri_orig")),      "n_sdri_orig":    acc["n_sdri_orig"],
-            "stoi":            _jv(_avg(acc, "stoi")),            "n_stoi":         acc["n_stoi"],
+            "si_sdri_vo":      _jv(_avg(acc, "sisdri_vo")),    "n_sisdri_vo":    acc["n_sisdri_vo"],
             "stoii":           _jv(_avg(acc, "stoii")),           "n_stoii":        acc["n_stoii"],
-            "pesq":            _jv(_avg(acc, "pesq")),            "n_pesq":         acc["n_pesq"],
+            "estoii":          _jv(_avg(acc, "estoii")),         "n_estoii":       acc["n_estoii"],
             "pesqi":           _jv(_avg(acc, "pesqi")),           "n_pesqi":        acc["n_pesqi"],
-            "stoi_orig":       _jv(_avg(acc, "stoi_orig")),       "n_stoi_orig":    acc["n_stoi_orig"],
-            "stoii_orig":      _jv(_avg(acc, "stoii_orig")),      "n_stoii_orig":   acc["n_stoii_orig"],
-            "estoi_orig":      _jv(_avg(acc, "estoi_orig")),      "n_estoi_orig":   acc["n_estoi_orig"],
-            "estoii_orig":     _jv(_avg(acc, "estoii_orig")),     "n_estoii_orig":  acc["n_estoii_orig"],
-            "pesq_orig":       _jv(_avg(acc, "pesq_orig")),       "n_pesq_orig":    acc["n_pesq_orig"],
-            "dur_avg":         _jv(_avg(acc, "dur")),             "n_dur":          acc["n_dur"],
+            # Model uncertainty
             "uq_sigma":        _jv(_avg(acc, "uq")),              "n_uq":           acc["n_uq"],
             "uq_sigma_active": _jv(_avg(acc, "uq_active")),      "n_uq_active":    acc["n_uq_active"],
             "uq_sigma_silence":        _jv(_avg(acc, "uq_silence")),        "n_uq_silence":        acc["n_uq_silence"],
@@ -414,28 +357,13 @@ def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
             return float(np.nanmean([_avg(nsrc_acc[n], key) for n in n_src_list]))
 
     results["overall"] = {
-        "si_sdri_vo_avg":      _jv(_nm("sisdri_vo")),
-        "si_sdr_out_vo_avg":   _jv(_nm("si_sdr_out_vo")),
-        "si_sdr_mix_vo_avg":   _jv(_nm("si_sdr_mix_vo")),
-        "estoi_avg":           _jv(_nm("estoi")),
-        "estoii_avg":          _jv(_nm("estoii")),
-        "si_snri_avg":         _jv(_nm("sisnri")),
-        "si_snr_out_avg":      _jv(_nm("si_snr_out")),
-        "si_snr_mix_avg":      _jv(_nm("si_snr_mix")),
+        # Paper metrics: improvement over mixture baseline, vs vocoded target.
         "sdri_vo_avg":         _jv(_nm("sdri_vo")),
-        "snri_vo_avg":         _jv(_nm("snri_vo")),
-        "si_sdri_orig_avg":    _jv(_nm("sisdri_orig")),
-        "sdri_orig_avg":       _jv(_nm("sdri_orig")),
-        "stoi_avg":            _jv(_nm("stoi")),
+        "si_sdri_vo_avg":      _jv(_nm("sisdri_vo")),
         "stoii_avg":           _jv(_nm("stoii")),
-        "pesq_avg":            _jv(_nm("pesq")),
+        "estoii_avg":          _jv(_nm("estoii")),
         "pesqi_avg":           _jv(_nm("pesqi")),
-        "stoi_orig_avg":       _jv(_nm("stoi_orig")),
-        "stoii_orig_avg":      _jv(_nm("stoii_orig")),
-        "estoi_orig_avg":      _jv(_nm("estoi_orig")),
-        "estoii_orig_avg":     _jv(_nm("estoii_orig")),
-        "pesq_orig_avg":       _jv(_nm("pesq_orig")),
-        "dur_avg":             _jv(_nm("dur")),
+        # Model uncertainty
         "uq_sigma_avg":        _jv(_nm("uq")),
         "uq_sigma_active_avg": _jv(_nm("uq_active")),
         "uq_sigma_silence_avg":  _jv(_nm("uq_silence")),
@@ -453,19 +381,9 @@ def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
     def _f6(v): return f"{v:.6f}" if v is not None else "N/A"
     print(
         f"\n[OVERALL]  "
+        f"SDRi(vo)={_f2(ov['sdri_vo_avg'])} dB  "
         f"SI-SDRi(vo)={_f2(ov['si_sdri_vo_avg'])} dB  "
-        f"SI-SDR_out(vo)={_f2(ov['si_sdr_out_vo_avg'])} dB  "
-        f"SI-SDR_mix(vo)={_f2(ov['si_sdr_mix_vo_avg'])} dB  "
-        f"ESTOi={_f4(ov['estoi_avg'])}  ESTOii={_f4(ov['estoii_avg'])}  "
-        f"SI-SNRi={_f2(ov['si_snri_avg'])} dB  "
-        f"SI-SNR_out={_f2(ov['si_snr_out_avg'])} dB  SI-SNR_mix={_f2(ov['si_snr_mix_avg'])} dB  "
-        f"SDRi(vo)={_f2(ov['sdri_vo_avg'])} dB  SNRi(vo)={_f2(ov['snri_vo_avg'])} dB  "
-        f"SI-SDRi(orig)={_f2(ov['si_sdri_orig_avg'])} dB  SDRi(orig)={_f2(ov['sdri_orig_avg'])} dB  "
-        f"STOI={_f4(ov['stoi_avg'])}  STOIi={_f4(ov['stoii_avg'])}  PESQ={_f4(ov['pesq_avg'])}  PESQi={_f4(ov['pesqi_avg'])}  "
-        f"STOI(orig)={_f4(ov['stoi_orig_avg'])}  STOIi(orig)={_f4(ov['stoii_orig_avg'])}  "
-        f"ESTOI(orig)={_f4(ov['estoi_orig_avg'])}  ESTOIi(orig)={_f4(ov['estoii_orig_avg'])}  "
-        f"PESQ(orig)={_f4(ov['pesq_orig_avg'])}  "
-        f"Dur={_f2(ov['dur_avg'])} s  "
+        f"STOIi={_f4(ov['stoii_avg'])}  ESTOIi={_f4(ov['estoii_avg'])}  PESQi={_f4(ov['pesqi_avg'])}  "
         f"UQ(sigma)={_f6(ov['uq_sigma_avg'])}  UQ(sigma_active)={_f6(ov['uq_sigma_active_avg'])}"
     )
     if ov.get("uq_sigma_silence_avg") is not None:

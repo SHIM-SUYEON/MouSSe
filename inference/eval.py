@@ -790,18 +790,11 @@ def _eval_loop(backbone, uq_head, stno_proj, test_loaders, device,
         acc = nsrc_acc[n_src]
         print(
             f"[n_src={n_src}]  "
-            f"SI-SDRi(vo)={_avg(acc,'sisdri_vo'):.2f} dB (n={acc['n_sisdri_vo']})  "
-            f"SI-SDR_out(vo)={_avg(acc,'si_sdr_out_vo'):.2f} dB  "
-            f"SI-SDR_mix(vo)={_avg(acc,'si_sdr_mix_vo'):.2f} dB  "
-            f"ESTOi={_avg(acc,'estoi'):.4f} (n={acc['n_estoi']})  "
-            f"ESTOii={_avg(acc,'estoii'):.4f} (n={acc['n_estoii']})  "
-            f"SI-SNRi={_avg(acc,'sisnri'):.2f} dB (n={acc['n_sisnri']})  "
             f"SDRi(vo)={_avg(acc,'sdri_vo'):.2f} dB (n={acc['n_sdri_vo']})  "
-            f"SNRi(vo)={_avg(acc,'snri_vo'):.2f} dB (n={acc['n_snri_vo']})  "
-            f"STOI={_avg(acc,'stoi'):.4f} (n={acc['n_stoi']})  "
-            f"PESQ={_avg(acc,'pesq'):.4f} (n={acc['n_pesq']})  "
+            f"SI-SDRi(vo)={_avg(acc,'sisdri_vo'):.2f} dB (n={acc['n_sisdri_vo']})  "
+            f"STOIi={_avg(acc,'stoii'):.4f} (n={acc['n_stoii']})  "
+            f"ESTOIi={_avg(acc,'estoii'):.4f} (n={acc['n_estoii']})  "
             f"PESQi={_avg(acc,'pesqi'):.4f} (n={acc['n_pesqi']})  "
-            f"Dur={_avg(acc,'dur'):.2f} s (n={acc['n_dur']})  "
             f"[dur_skipped(>{MAX_MIX_DURATION}s): {dur_skip_cnt}  PESQ skipped (no utterances): {pesq_skip_cnt}]"
         )
         if acc["n_uq_silence"] > 0:
@@ -867,10 +860,20 @@ def _save_results(results, out_dir, ckpt_path, args):
     out_dir.mkdir(parents=True, exist_ok=True)
 
     per_sample = results.pop("per_sample", [])
+    # Paper metrics only (improvement over mixture baseline, vs vocoded target).
+    KEEP_SPK = ("sdri_vo", "sisdri_vo", "stoii", "estoii", "pesqi")
+    per_sample_trim = []
+    for rec in per_sample:
+        out = {k: rec.get(k) for k in ("stem", "n_src", "lang", "gender", "overlap")}
+        for s in range(1, rec["n_src"] + 1):
+            spk_key = f"s{s}"
+            if spk_key in rec:
+                out[spk_key] = {k: rec[spk_key].get(k) for k in KEEP_SPK}
+        per_sample_trim.append(out)
     per_sample_path = out_dir / "per_sample_metrics.json"
     with open(per_sample_path, "w") as f:
-        json.dump(per_sample, f, indent=2)
-    print(f"[EVAL] Per-sample metrics saved to {per_sample_path}  ({len(per_sample)} records)")
+        json.dump(per_sample_trim, f, indent=2)
+    print(f"[EVAL] Per-sample metrics saved to {per_sample_path}  ({len(per_sample_trim)} records)")
 
     uq_json_records = []
     for rec in per_sample:
@@ -883,28 +886,13 @@ def _save_results(results, out_dir, ckpt_path, args):
                 "stem": rec["stem"], "n_src": rec["n_src"],
                 "lang": rec["lang"], "gender": rec["gender"], "overlap": rec["overlap"],
                 "speaker_slot": spk_key,
-                "sisdri_vo":       sd.get("sisdri_vo"),
-                "si_sdr_out_vo":   sd.get("si_sdr_out_vo"),
-                "si_sdr_mix_vo":   sd.get("si_sdr_mix_vo"),
-                "estoi":           sd.get("estoi"),
-                "estoii":          sd.get("estoii"),
-                "si_snri":         sd.get("si_snri"),
-                "si_snr_out":      sd.get("si_snr_out"),
-                "si_snr_mix":      sd.get("si_snr_mix"),
+                # Paper metrics (improvement over mixture baseline, vs vocoded target)
                 "sdri_vo":         sd.get("sdri_vo"),
-                "snri_vo":         sd.get("snri_vo"),
-                "sisdri_orig":     sd.get("sisdri_orig"),
-                "sdri_orig":       sd.get("sdri_orig"),
-                "stoi":            sd.get("stoi"),
+                "sisdri_vo":       sd.get("sisdri_vo"),
                 "stoii":           sd.get("stoii"),
-                "pesq":            sd.get("pesq"),
+                "estoii":          sd.get("estoii"),
                 "pesqi":           sd.get("pesqi"),
-                "stoi_orig":       sd.get("stoi_orig"),
-                "stoii_orig":      sd.get("stoii_orig"),
-                "estoi_orig":      sd.get("estoi_orig"),
-                "estoii_orig":     sd.get("estoii_orig"),
-                "pesq_orig":       sd.get("pesq_orig"),
-                "dur":             sd.get("dur"),
+                # Model uncertainty
                 "uq_sigma_mean":   sd.get("uq_sigma_mean"),
                 "uq_sigma_active": sd.get("uq_sigma_active"),
             })
