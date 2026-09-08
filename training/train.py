@@ -44,38 +44,14 @@ except ImportError:
 
 from mousse.configs import config
 from mousse.models import AudioFlow, UncertaintyHead
-from mousse.models.tensors import count_parameters
 from mousse.utils.dataset import make_dataset
+from mousse.models.patches import STNOProjection, make_slot_id, apply_forward_patches
+from mousse.utils.vocoder import get_vocoder, do_vocoder
 
 # -----------------------------------------------------------------
 # STNO conditioning projection (Stage 2)
 # -----------------------------------------------------------------
-class STNOProjection(torch.nn.Module):
-    """Maps oracle STNO features (p_T, p_N, p_O, slot_id) into the backbone's
-    hidden space via the existing 'condition' pathway in generic_safe_forward.
-    Zero-init on the output layer so conditioning starts as identity."""
-    def __init__(self, n_dim: int):
-        super().__init__()
-        self.proj = torch.nn.Sequential(
-            torch.nn.Linear(4, n_dim // 4),
-            torch.nn.SiLU(),
-            torch.nn.Dropout(p=0.1),
-            torch.nn.Linear(n_dim // 4, n_dim),
-        )
-        torch.nn.init.zeros_(self.proj[3].weight)
-        torch.nn.init.zeros_(self.proj[3].bias)
 
-    def forward(self, p_T: torch.Tensor, p_N: torch.Tensor,
-                p_O: torch.Tensor, slot_id: torch.Tensor) -> torch.Tensor:
-        feat = torch.stack([p_T, p_N, p_O, slot_id], dim=-1)  # [B, T, 4]
-        return self.proj(feat)                                  # [B, T, n_dim]
-
-
-def make_slot_id(B: int, n_src: int, T_single: int, device) -> torch.Tensor:
-    slot_id = torch.zeros(B, n_src * T_single, device=device)
-    for s in range(n_src):
-        slot_id[:, s * T_single:(s + 1) * T_single] = s / max(n_src - 1, 1)
-    return slot_id
 
 # from pyannote.audio import Pipeline
 
@@ -164,7 +140,6 @@ N_SRC_LIST            = [2, 3, 4]
 VAL_SAMPLES_PER_NSRC  = 100 #1300    # 3 x 200 = 600 total val (was 1300, reduced for speed)
 TRAIN_LOADER_WORKERS  = 5
 TRAIN_MIXED_PRECISION = "bf16"
-VOCODER_SAMPLE_RATE   = 24000  # bigvsan generates at 24 kHz; do_vocoder resamples to config.audio.sample_rate (16 kHz)
 MAX_FRAMES_PER_SPK    = 600 #300
 MAX_EVAL_FRAMES_PER_SPK = 1500 #1200
 
@@ -241,49 +216,9 @@ def pit_nll_loss(pred_mean, pred_log_sigma, target, n_src, mask=None):
     return best_loss
 
 
-def do_vocoder(spec, vocoder, device):
-    with torch.no_grad():
-        wav = vocoder.generate(spec.T.to(torch.float32).to(device)).squeeze(0)
-    if VOCODER_SAMPLE_RATE != config.audio.sample_rate:
-        wav = torchaudio.functional.resample(wav.unsqueeze(0), VOCODER_SAMPLE_RATE, config.audio.sample_rate).squeeze(0)
-    return wav
 
 
 
-_VOCODER_CACHE = None
-
-def get_vocoder(device):
-    global _VOCODER_CACHE
-    if _VOCODER_CACHE is not None:
-        return _VOCODER_CACHE.to(device)
-    cached_hub = os.path.expanduser("~/.cache/torch/hub/ex3ndr_supervoice-vocoder_master")
-    print(f"Cached hub: {cached_hub}")
-    # exit()
-    try:
-        src = cached_hub if os.path.exists(cached_hub) else "ex3ndr/supervoice-vocoder"
-        load_kw = dict(source="local") if os.path.exists(cached_hub) else {}
-        vocoder = torch.hub.load(src, "bigvsan", **load_kw)
-        # if FT_VOCODER_PATH.exists():
-        if FT_VOCODER_PATH is not None and FT_VOCODER_PATH.exists():
-            ft_ckpt = torch.load(str(FT_VOCODER_PATH), map_location="cpu")
-            vocoder.load_state_dict(ft_ckpt["vocoder"])
-            print("[VOCODER] Fine-tuned vocoder loaded.")
-        else:
-            print("[VOCODER] Using base vocoder weights.")
-        vocoder = vocoder.eval()
-        _VOCODER_CACHE = vocoder
-        return vocoder.to(device)
-    except Exception as e:
-        print(f"[VOCODER] Unavailable: {e}")
-        return None
-
-
-
-def _rms_normalize(wav: torch.Tensor, target_rms: float = 0.1) -> torch.Tensor:
-    rms = wav.pow(2).mean().sqrt()
-    if rms < 1e-8:
-        return wav
-    return wav * (target_rms / rms)
 
 
 def fast_euler_sample_uq(
@@ -469,332 +404,85 @@ def compute_eval_stats(
 # -----------------------------------------------------------------
 # Full waveform evaluation
 # -----------------------------------------------------------------
-def evaluate_metrics(
-    predictor, uq_head, val_loaders_dict, device, accelerator, save_directory,
-    stage=1, step=0, max_samples=VAL_SAMPLES_PER_NSRC,
-):
-    predictor.eval()
-    uq_head.eval()
-
-    sr      = config.audio.sample_rate
-    PESQ_SR = 16000
-    stoi_m  = ShortTimeObjectiveIntelligibility(fs=sr).to(device)
-    pesq_m  = PerceptualEvaluationSpeechQuality(fs=PESQ_SR, mode="wb").to(device)
-    sisnr_m = ScaleInvariantSignalNoiseRatio().to(device)
-
-    vocoder = get_vocoder(device)
-
-    eval_wav_dir = os.path.join(save_directory, f"step_{step}")
-    if accelerator.is_main_process and vocoder is not None:
-        os.makedirs(eval_wav_dir, exist_ok=True)
-
-    total_stoi,   n_stoi  = 0., 0
-    total_pesq,   n_pesq  = 0., 0
-    total_sisnri, n_sisnr = 0., 0
-
-    for n_src, val_loader in val_loaders_dict.items():
-        n_samples = min(max_samples, len(val_loader.dataset))
-        val_iter  = iter(val_loader)
-
-        for item_idx in range(n_samples):
-            try:
-                condition_spec, flow_target, batch_mix_paths, batch_src_paths = next(val_iter)
-            except StopIteration:
-                break
-
-            if flow_target.ndim == 4:
-                flow_target    = rearrange(flow_target, "b s t d -> b (s t) d")
-                condition_spec = torch.repeat_interleave(condition_spec, repeats=n_src, dim=1)
-
-            single_cond    = condition_spec[0:1].to(device)
-            single_target  = flow_target[0:1].to(device)
-            item_src_paths = batch_src_paths[0] if batch_src_paths else []
-
-            seq_len   = single_cond.shape[1]
-            T_per_spk = seq_len // n_src
-            if T_per_spk > MAX_EVAL_FRAMES_PER_SPK:
-                T_per_spk     = MAX_EVAL_FRAMES_PER_SPK
-                seq_len       = T_per_spk * n_src
-                single_cond   = single_cond[:, :seq_len, :]
-                single_target = single_target[:, :seq_len, :]
-
-            if stage == 2:
-                # Apply the same oracle STNO conditioning used in training so
-                # backbone sees in-distribution input during evaluation.
-                with torch.no_grad():
-                    d_st_total = (single_target.abs().sum(dim=-1) > 1e-4).float()
-                    d_st = d_st_total.reshape(1, n_src, T_per_spk)
-                    p_S_e = torch.prod(1.0 - d_st, dim=1, keepdim=True)
-                    p_T_el, p_N_el, p_O_el = [], [], []
-                    for s_k in range(n_src):
-                        d_sk = d_st[:, s_k:s_k+1, :]
-                        mo = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
-                        p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
-                        p_T_el.append(d_sk * p_oth)
-                        p_O_el.append(d_sk * (1.0 - p_oth))
-                        p_N_el.append((1.0 - p_S_e) - d_sk * p_oth - d_sk * (1.0 - p_oth))
-                    p_T_e = torch.cat(p_T_el, dim=1).reshape(1, n_src * T_per_spk, 1)
-                    p_N_e = torch.cat(p_N_el, dim=1).reshape(1, n_src * T_per_spk, 1)
-                    p_O_e = torch.cat(p_O_el, dim=1).reshape(1, n_src * T_per_spk, 1)
-                    stno_cond = single_cond * (1.0 + 0.5 * p_T_e - 0.2 * p_N_e + 0.1 * p_O_e)
-                norm_cond = (stno_cond - config.audio.norm_mean) / config.audio.norm_std
-            else:
-                norm_cond = (single_cond - config.audio.norm_mean) / config.audio.norm_std
-            mix_input = norm_cond.to(dtype=torch.bfloat16)
-
-            eval_alpha = 0.0 if stage == 1 else 1.5
-            sep_spec = fast_euler_sample_uq(
-                predictor, uq_head, mix_input, steps=16,
-                alpha=eval_alpha, lambda_max=2.0, use_uq_guidance=True,
-            )
-
-            sep_flat  = sep_spec.detach()[0].to(torch.float32)
-            tgt_flat  = single_target[0].to(torch.float32)
-            cond_flat = single_cond[0].to(torch.float32)
-
-            # sep_flat is in normalized mel space (model output) → denormalize.
-            # tgt_flat comes from the dataset already in original mel scale → keep as-is.
-            denorm_sep  = sep_flat  * config.audio.norm_std + config.audio.norm_mean
-            denorm_tgt  = tgt_flat
-            denorm_cond = cond_flat
-
-            denorm_sep = torch.nan_to_num(denorm_sep, nan=0.0, posinf=1.0, neginf=-1.0)
-
-            pred_channels = [denorm_sep[s*T_per_spk:(s+1)*T_per_spk, :].flatten() for s in range(n_src)]
-            tgt_channels = [denorm_tgt[s*T_per_spk:(s+1)*T_per_spk, :].flatten() for s in range(n_src)]
-            mix_channels = [denorm_cond[0:T_per_spk, :].flatten() for _ in range(n_src)]
-
-            cost_mat = np.zeros((n_src, n_src))
-            for pi in range(n_src):
-                for ti in range(n_src):
-                    cost_mat[pi, ti] = -sisnr_m(pred_channels[pi], tgt_channels[ti]).item()
-            pred_ind, tgt_ind = linear_sum_assignment(cost_mat)
-
-            for pi, ti in zip(pred_ind, tgt_ind):
-                p_vec = pred_channels[pi]
-                t_vec = tgt_channels[ti]
-                m_vec = mix_channels[pi]
-                spec_shape = (T_per_spk, config.audio.n_mels)
-
-                try:
-                    sisnr_p   = -cost_mat[pi, ti]
-                    sisnr_mix = sisnr_m(m_vec, t_vec).item()
-                    total_sisnri += sisnr_p - sisnr_mix
-                    n_sisnr += 1
-                except Exception as e:
-                    print(f"[EVAL] SI-SNRi error n_src={n_src} spk={pi}: {e}")
-
-                wav_p_active = wav_t_active = None
-                src_mel_frames    = T_per_spk
-                actual_wav_frames = T_per_spk * config.audio.hop_size
-
-                if ti < len(item_src_paths):
-                    try:
-                        info = torchaudio.info(item_src_paths[ti])
-                        actual_wav_frames = int(info.num_frames * config.audio.sample_rate / info.sample_rate)
-                        src_mel_frames = min(int(actual_wav_frames / config.audio.hop_size), T_per_spk)
-                    except Exception:
-                        pass
-
-                if vocoder is not None:
-                    try:
-                        p_spec = p_vec.view(spec_shape)[:src_mel_frames]
-                        t_spec = t_vec.view(spec_shape)[:src_mel_frames]
-                        with torch.no_grad():
-                            wav_p_active = do_vocoder(p_spec, vocoder, device)
-                            wav_t_active = do_vocoder(t_spec, vocoder, device)
-                    except Exception as e:
-                        print(f"[EVAL] Vocoder error n_src={n_src} spk={pi}: {e}")
-
-                if wav_p_active is not None and wav_t_active is not None:
-                    wav_p_norm = _rms_normalize(wav_p_active)
-                    wav_t_norm = _rms_normalize(wav_t_active)
-                    # _rms_normalize returns the original tensor unchanged when RMS < 1e-8
-                    # (near-silent prediction). PESQ/STOI VADs will reject that audio, so
-                    # gate both metrics on a minimum post-normalization RMS.
-                    _MIN_RMS = 1e-3
-                    has_speech = (
-                        wav_p_norm.pow(2).mean().sqrt().item() >= _MIN_RMS and
-                        wav_t_norm.pow(2).mean().sqrt().item() >= _MIN_RMS
-                    )
-                    min_stoi_samples = int(sr * 0.5)
-                    if has_speech and wav_p_norm.shape[-1] >= min_stoi_samples and wav_t_norm.shape[-1] >= min_stoi_samples:
-                        try:
-                            total_stoi += stoi_m(wav_p_norm, wav_t_norm).item()
-                            n_stoi += 1
-                        except Exception as e:
-                            print(f"[EVAL] STOI error n_src={n_src} spk={pi}: {e}")
-                    min_pesq_samples = int(PESQ_SR * 0.25)
-                    if has_speech:
-                        try:
-                            wav_p_16k = torchaudio.functional.resample(wav_p_norm.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                            wav_t_16k = torchaudio.functional.resample(wav_t_norm.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                            if wav_p_16k.shape[-1] >= min_pesq_samples and wav_t_16k.shape[-1] >= min_pesq_samples:
-                                total_pesq += pesq_m(wav_p_16k, wav_t_16k).item()
-                                n_pesq += 1
-                        except Exception as e:
-                            print(f"[EVAL] PESQ error n_src={n_src} spk={pi}: {e}")
-
-                    if accelerator.is_main_process and item_idx == 0:
-                        wav_p_full = F.pad(wav_p_active, (0, max(0, actual_wav_frames - wav_p_active.shape[-1])))[:actual_wav_frames]
-                        src_stem = os.path.splitext(os.path.basename(item_src_paths[ti]))[0] if ti < len(item_src_paths) else "unknown"
-                        torchaudio.save(os.path.join(eval_wav_dir, f"n{n_src}_pred_spk{pi}_matched_to_spk{ti}__{src_stem}.wav"), wav_p_full.cpu().unsqueeze(0), sr)
-                        if step == 0:
-                            wav_t_full = F.pad(wav_t_active, (0, max(0, actual_wav_frames - wav_t_active.shape[-1])))[:actual_wav_frames]
-                            torchaudio.save(os.path.join(eval_wav_dir, f"n{n_src}_target_spk{ti}__{src_stem}.wav"), wav_t_full.cpu().unsqueeze(0), sr)
-                            with torch.no_grad():
-                                wav_mix = do_vocoder(denorm_cond[0:T_per_spk, :], vocoder, device)
-                            mix_len = T_per_spk * config.audio.hop_size
-                            wav_mix_full = F.pad(wav_mix, (0, max(0, mix_len - wav_mix.shape[-1])))[:mix_len]
-                            torchaudio.save(os.path.join(eval_wav_dir, f"n{n_src}_mixture.wav"), wav_mix_full.cpu().unsqueeze(0), sr)
-
-    del stoi_m, pesq_m, sisnr_m
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    metrics = {
-        "val/stoi":    total_stoi   / max(1, n_stoi),
-        "val/pesq":    total_pesq   / max(1, n_pesq),
-        "val/si_snri": total_sisnri / max(1, n_sisnr),
-    }
-    print(f"[EVAL] PIT-STOI: {metrics['val/stoi']:.4f} (n={n_stoi})  PIT-PESQ: {metrics['val/pesq']:.4f} (n={n_pesq})  SI-SNRi: {metrics['val/si_snri']:.2f} dB (n={n_sisnr})")
-    return metrics
 
 
 # -----------------------------------------------------------------
 # Model patches
 # -----------------------------------------------------------------
-def apply_training_patches():
-    import mousse.models.audio_flow as sf_model
-    from torch.nn.attention import sdpa_kernel, SDPBackend
-    from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
-    def safe_sinu_forward(self, x):
-        x = x.reshape(-1)
-        x = rearrange(x, "b -> b 1")
-        freqs = x * rearrange(self.weights, "d -> 1 d") * 2 * math.pi
-        return torch.cat((freqs.sin(), freqs.cos()), dim=-1)
 
-    def generic_safe_forward(self, *, audio, noise, condition=None, times, mask=None, target=None, mask_loss=False):
-        _, _tangent = fwad.unpack_dual(noise)
-        is_jvp = (audio.ndim > 3) or (_tangent is not None)
+# -----------------------------------------------------------------
+# Model patches
+# -----------------------------------------------------------------
+def patched_sample_with_uncertainty(self, *, audio, uq_head, steps, alpha=1.5, lambda_max=2.0, use_uq_guidance=False):
+    device     = audio.device
+    batch_size = audio.shape[0]
+    z          = torch.randn_like(audio)
+    U          = torch.zeros_like(audio)
+    dt_nominal = 1.0 / steps
+    gamma      = 10.0
+    t_curr     = 0.0
+    MAX_ITERS  = steps * 8
+    n_iter     = 0
 
-        if is_jvp:
-            backend_ctx = sdpa_kernel([SDPBackend.MATH])
-        elif self.training:
-            backend_ctx = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION])
+    while t_curr < 1.0 - 1e-6 and n_iter < MAX_ITERS:
+        n_iter += 1
+        t_batch     = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
+        audio_empty = torch.zeros_like(audio)
+
+        with torch.no_grad():
+            v_uncond     = self.forward(audio=audio_empty, noise=z, times=t_batch)
+            v_cond       = self.forward(audio=audio,       noise=z, times=t_batch)
+            log_s_uncond = uq_head(audio=audio_empty, noise=z, times=t_batch)
+            log_s_cond   = uq_head(audio=audio,       noise=z, times=t_batch)
+
+        sigma_uncond = torch.exp(log_s_uncond)
+        sigma_cond   = torch.exp(log_s_cond)
+
+        num = torch.sum(sigma_uncond * sigma_cond - sigma_cond ** 2, dim=-1, keepdim=True)
+        den = torch.sum((sigma_cond - sigma_uncond) ** 2, dim=-1, keepdim=True).clamp(min=1e-8)
+        lambda_star  = torch.clamp(num / den, min=0.0, max=lambda_max)
+        var_velocity = ((1.0 + lambda_star) * sigma_cond - lambda_star * sigma_uncond) ** 2
+
+        uq_mean_var = torch.mean(var_velocity).item()
+        dt_dynamic  = dt_nominal / (1.0 + gamma * uq_mean_var)
+        dt_dynamic  = max(dt_dynamic, dt_nominal / 4)
+        dt_dynamic  = min(dt_dynamic, 1.0 - t_curr)
+
+        if use_uq_guidance:
+            v_guided = v_cond + (v_cond - v_uncond) * lambda_star
         else:
-            backend_ctx = sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
+            v_guided = v_cond + (v_cond - v_uncond) * alpha
 
-        with backend_ctx:
-            combined = torch.cat([audio, noise], dim=-1)
-            if hasattr(self, "transformer_input"):
-                output = self.transformer_input(combined)
-            else:
-                output = self.input_layer(combined)
-            if condition is not None:
-                output = output + condition
+        rademacher = torch.randint(0, 2, z.shape, device=device, dtype=z.dtype) * 2 - 1
+        std_state  = torch.sqrt(U.clamp(min=1e-8))
+        v_vector   = std_state * rademacher
 
-            orig_shape = list(output.shape)
-            seq_len  = orig_shape[-2]
-            feat_dim = orig_shape[-1]
-            leading  = orig_shape[:-2]
+        def local_velocity_fn(z_input):
+            t_in = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
+            v_u = self.forward(audio=torch.zeros_like(audio), noise=z_input, times=t_in)
+            v_c = self.forward(audio=audio, noise=z_input, times=t_in)
+            return v_c + (v_c - v_u) * alpha
 
-            raw_sinu   = self.sinu_pos_emb(times)
-            sinu_times = raw_sinu.view(leading + [1, feat_dim])
+        with fwad.dual_level():
+            z_dual   = fwad.make_dual(z, v_vector)
+            out_dual = local_velocity_fn(z_dual)
+            _, jvp_out = fwad.unpack_dual(out_dual)
 
-            output      = torch.cat([output, sinu_times], dim=-2)
-            output_flat = output.view(-1, seq_len + 1, feat_dim)
-            output_flat = self.conv_embed(output_flat) + output_flat
+        if jvp_out is None:
+            jvp_out = torch.zeros_like(z)
 
-            if self.training and not is_jvp:
-                output_flat = grad_checkpoint(self.transformer, output_flat, use_reentrant=False)
-            else:
-                output_flat = self.transformer(output_flat)
+        U      = U + (var_velocity * dt_dynamic) ** 2 + 2.0 * dt_dynamic * (v_vector * jvp_out)
+        z      = z + v_guided * dt_dynamic
+        t_curr = t_curr + dt_dynamic
 
-            output_flat = self.prediction(output_flat)
-            output_flat = output_flat[..., :-1, :]
-            output = output_flat.view(leading + [seq_len, config.audio.n_mels])
+    return z, torch.mean(U, dim=-1)
 
-            if target is not None:
-                loss = F.mse_loss(output, target, reduction="none")
-                loss = reduce(loss, "b n d -> b n", "mean")
-                if mask_loss:
-                    loss = loss.masked_fill(~mask, 0.)
-                    n_masked = mask.sum(dim=-1).clamp(min=1)
-                    loss = loss.sum(dim=-1) / n_masked
-                else:
-                    loss = loss.sum(dim=-1) / target.shape[1]
-                return output, loss.mean()
-            return output
 
-    def patched_sample_with_uncertainty(self, *, audio, uq_head, steps, alpha=1.5, lambda_max=2.0, use_uq_guidance=False):
-        device     = audio.device
-        batch_size = audio.shape[0]
-        z          = torch.randn_like(audio)
-        U          = torch.zeros_like(audio)
-        dt_nominal = 1.0 / steps
-        gamma      = 10.0
-        t_curr     = 0.0
-        MAX_ITERS  = steps * 8
-        n_iter     = 0
-
-        while t_curr < 1.0 - 1e-6 and n_iter < MAX_ITERS:
-            n_iter += 1
-            t_batch     = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
-            audio_empty = torch.zeros_like(audio)
-
-            with torch.no_grad():
-                v_uncond     = self.forward(audio=audio_empty, noise=z, times=t_batch)
-                v_cond       = self.forward(audio=audio,       noise=z, times=t_batch)
-                log_s_uncond = uq_head(audio=audio_empty, noise=z, times=t_batch)
-                log_s_cond   = uq_head(audio=audio,       noise=z, times=t_batch)
-
-            sigma_uncond = torch.exp(log_s_uncond)
-            sigma_cond   = torch.exp(log_s_cond)
-
-            num = torch.sum(sigma_uncond * sigma_cond - sigma_cond ** 2, dim=-1, keepdim=True)
-            den = torch.sum((sigma_cond - sigma_uncond) ** 2, dim=-1, keepdim=True).clamp(min=1e-8)
-            lambda_star  = torch.clamp(num / den, min=0.0, max=lambda_max)
-            var_velocity = ((1.0 + lambda_star) * sigma_cond - lambda_star * sigma_uncond) ** 2
-
-            uq_mean_var = torch.mean(var_velocity).item()
-            dt_dynamic  = dt_nominal / (1.0 + gamma * uq_mean_var)
-            dt_dynamic  = max(dt_dynamic, dt_nominal / 4)
-            dt_dynamic  = min(dt_dynamic, 1.0 - t_curr)
-
-            if use_uq_guidance:
-                v_guided = v_cond + (v_cond - v_uncond) * lambda_star
-            else:
-                v_guided = v_cond + (v_cond - v_uncond) * alpha
-
-            rademacher = torch.randint(0, 2, z.shape, device=device, dtype=z.dtype) * 2 - 1
-            std_state  = torch.sqrt(U.clamp(min=1e-8))
-            v_vector   = std_state * rademacher
-
-            def local_velocity_fn(z_input):
-                t_in = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
-                v_u = self.forward(audio=torch.zeros_like(audio), noise=z_input, times=t_in)
-                v_c = self.forward(audio=audio, noise=z_input, times=t_in)
-                return v_c + (v_c - v_u) * alpha
-
-            with fwad.dual_level():
-                z_dual   = fwad.make_dual(z, v_vector)
-                out_dual = local_velocity_fn(z_dual)
-                _, jvp_out = fwad.unpack_dual(out_dual)
-
-            if jvp_out is None:
-                jvp_out = torch.zeros_like(z)
-
-            U      = U + (var_velocity * dt_dynamic) ** 2 + 2.0 * dt_dynamic * (v_vector * jvp_out)
-            z      = z + v_guided * dt_dynamic
-            t_curr = t_curr + dt_dynamic
-
-        return z, torch.mean(U, dim=-1)
-
-    sf_model.LearnedSinusoidalPosEmb.forward = safe_sinu_forward
-    sf_model.AudioFlow.forward = generic_safe_forward
-    sf_model.UncertaintyHead.forward = generic_safe_forward
+def apply_training_patches():
+    """Install the shared forward patches, plus the training-only
+    uncertainty-aware sampler (AudioFlow.sample_with_uncertainty)."""
+    sf_model = apply_forward_patches()
     sf_model.AudioFlow.sample_with_uncertainty = patched_sample_with_uncertainty
 
 

@@ -66,7 +66,7 @@ mixtures and update the paths in the `.scp` files (or point `scp_base_dir` /
 symlink the audio to those locations). Speaker counts of 2, 3 and 4 are
 selected via the dataset key `librittskor2` / `librittskor3` / `librittskor4`.
 
-## Configuration (reproducibility)
+## Configuration
 
 All audio and model hyper-parameters live in
 [mousse/configs/config.py](mousse/configs/config.py) and are the single source
