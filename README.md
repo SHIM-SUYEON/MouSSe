@@ -10,22 +10,12 @@ model reported in the paper.
 ## Qualitative examples
 
 Each panel shows the input **mixture** (top) and, per source, the
-**ground-truth** (left) vs. the model's **separated** mel-spectrogram (right).
-The examples below are the best-scoring test mixture at each speaker count
-(ranked by per-utterance minimum SI-SNR); see
-[inference/eval.py](inference/eval.py) for how the metrics are computed.
+**ground-truth** (left) vs. the model's **separated** mel-spectrogram (right),
+across increasing speaker counts and overlap ratios.
 
-**2 speakers** — 0% overlap, min SI-SNR<sub>out</sub> = 14.6 dB, min SI-SNRi = 28.8 dB
-
-![2-speaker separation example](assets/demos/2spk_clean.png)
-
-**3 speakers** — 0% overlap, min SI-SNR<sub>out</sub> = 10.4 dB, min SI-SNRi = 42.0 dB
-
-![3-speaker separation example](assets/demos/3spk_clean.png)
-
-**4 speakers** — 0% overlap, min SI-SNR<sub>out</sub> = 11.5 dB, min SI-SNRi = 24.0 dB
-
-![4-speaker separation example](assets/demos/4spk_clean.png)
+| 2 speakers · 25% overlap | 3 speakers · 50% overlap | 4 speakers · 75% overlap |
+|:---:|:---:|:---:|
+| ![2-speaker separation example](assets/demos/2spk_ov25.png) | ![3-speaker separation example](assets/demos/3spk_ov50.png) | ![4-speaker separation example](assets/demos/4spk_ov75.png) |
 
 ## Repository layout
 
