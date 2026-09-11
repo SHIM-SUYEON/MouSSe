@@ -5,8 +5,6 @@ patched at run time with numerically-safe forward implementations that also
 support JVP (forward-mode autodiff) used by the uncertainty head. These patches
 are identical for training and inference; the training-only branches
 (`self.training`) are simply dormant at inference time (`model.eval()`).
-
-`STNOProjection` and `make_slot_id` build the optional STNO conditioning signal.
 """
 
 import math
@@ -19,37 +17,6 @@ from torch.nn.attention import sdpa_kernel, SDPBackend
 from torch.utils.checkpoint import checkpoint as grad_checkpoint
 
 from mousse.configs import config
-
-
-# -----------------------------------------------------------------
-# STNO conditioning projection (Stage 2)
-# -----------------------------------------------------------------
-class STNOProjection(torch.nn.Module):
-    """Maps oracle STNO features (p_T, p_N, p_O, slot_id) into the backbone's
-    hidden space via the existing 'condition' pathway in generic_safe_forward.
-    Zero-init on the output layer so conditioning starts as identity."""
-    def __init__(self, n_dim: int):
-        super().__init__()
-        self.proj = torch.nn.Sequential(
-            torch.nn.Linear(4, n_dim // 4),
-            torch.nn.SiLU(),
-            torch.nn.Dropout(p=0.1),
-            torch.nn.Linear(n_dim // 4, n_dim),
-        )
-        torch.nn.init.zeros_(self.proj[3].weight)
-        torch.nn.init.zeros_(self.proj[3].bias)
-
-    def forward(self, p_T: torch.Tensor, p_N: torch.Tensor,
-                p_O: torch.Tensor, slot_id: torch.Tensor) -> torch.Tensor:
-        feat = torch.stack([p_T, p_N, p_O, slot_id], dim=-1)  # [B, T, 4]
-        return self.proj(feat)                                  # [B, T, n_dim]
-
-
-def make_slot_id(B: int, n_src: int, T_single: int, device) -> torch.Tensor:
-    slot_id = torch.zeros(B, n_src * T_single, device=device)
-    for s in range(n_src):
-        slot_id[:, s * T_single:(s + 1) * T_single] = s / max(n_src - 1, 1)
-    return slot_id
 
 
 # -----------------------------------------------------------------

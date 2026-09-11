@@ -45,12 +45,8 @@ except ImportError:
 from mousse.configs import config
 from mousse.models import AudioFlow, UncertaintyHead
 from mousse.utils.dataset import make_dataset
-from mousse.models.patches import STNOProjection, make_slot_id, apply_forward_patches
+from mousse.models.patches import apply_forward_patches
 from mousse.utils.vocoder import get_vocoder, do_vocoder
-
-# -----------------------------------------------------------------
-# STNO conditioning projection (Stage 2)
-# -----------------------------------------------------------------
 
 
 # from pyannote.audio import Pipeline
@@ -64,9 +60,6 @@ PRETRAINED_BACKBONE_PATH = Path(
 STAGE1_SAVE_PATH = Path(
     "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/single-stage/0826/"
 )
-STAGE2_SAVE_PATH = Path(
-    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/stage2-0819/"
-)
 HP_SEARCH_PATH = Path(
     "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/hyper/stage1/"
 )
@@ -76,11 +69,10 @@ HP_SEARCH_PATH = Path(
 FT_VOCODER_PATH = None
 OPTUNA_DB = f"sqlite:///{HP_SEARCH_PATH}/optuna.db"
 
-for _p in [STAGE1_SAVE_PATH, STAGE2_SAVE_PATH, HP_SEARCH_PATH]:
+for _p in [STAGE1_SAVE_PATH, HP_SEARCH_PATH]:
     os.makedirs(_p, exist_ok=True)
 
 print(f"STAGE1_SAVE_PATH: {STAGE1_SAVE_PATH}")
-print(f"STAGE2_SAVE_PATH: {STAGE2_SAVE_PATH}")
 
 # -----------------------------------------------------------------
 # HP search control
@@ -91,18 +83,11 @@ STAGE1_SEARCH_STEPS      = 10000
 STAGE1_SEARCH_EVAL_EVERY = 2500
 STAGE1_N_TRIALS          = 20
 
-STAGE2_SEARCH_STEPS      = 2000
-STAGE2_SEARCH_EVAL_EVERY = 500
-STAGE2_N_TRIALS          = 20
-
 HP_SEARCH_EVAL_N = 50   # val samples per n_src for fast mel proxy
 
 STAGE1_FULL_STEPS    = 120000
 STAGE1_FULL_SAVE_EV  = [30000, 47500, 60000] # 10000
 STAGE1_FULL_EVAL_EV  = 1000
-STAGE2_FULL_STEPS    = 50000
-STAGE2_FULL_SAVE_EV  = 10000
-STAGE2_FULL_EVAL_EV  = 50000
 TRAIN_LOG_EVERY      = 1
 
 # Early stopping (Stage 1 full-training only)
@@ -112,7 +97,6 @@ EARLY_STOP_PATIENCE_EVALS = 20
 EARLY_STOP_MIN_DELTA_DB   = 0.2
 
 STAGE1_EXPERIMENT = "large-sep-0820"
-STAGE2_EXPERIMENT = "large-uq-0820"
 
 MANUAL_STAGE1_HP: Dict[str, Any] = {
     "lr_max": 1.40251473845546e-05,
@@ -122,15 +106,6 @@ MANUAL_STAGE1_HP: Dict[str, Any] = {
     "sigma": 3.2629595908661235e-06,
     "batch_size": 4,
     "grad_accum": 4,
-}
-MANUAL_STAGE2_HP: Dict[str, Any] = {
-    "lr_max": 1e-5,
-    "lr_start": 1e-8,
-    "warmup_steps": 1000,
-    "clip_norm": 0.5,
-    "sigma": 1e-5,
-    "batch_size": 4,
-    "grad_accum": 2,
 }
 
 # -----------------------------------------------------------------
@@ -266,11 +241,8 @@ def fast_euler_sample_uq(
 # -----------------------------------------------------------------
 def compute_eval_stats(
     predictor, val_loaders_dict: dict, device, sigma: float = 1e-5, n_per_nsrc: int = 5,
-    stno_proj=None,
 ) -> Dict[str, float]:
     predictor.eval()
-    if stno_proj is not None:
-        stno_proj.eval()
     total_loss = 0.0
     n_done = 0
     pred_bufs: list = []
@@ -293,64 +265,23 @@ def compute_eval_stats(
                 else:
                     T_single = cond.shape[1] // n_src
                     
-                # Enforce frame length truncation rule (MAX_FRAMES_PER_SPK = 200)
+                # Enforce frame length truncation rule
                 if T_single > MAX_FRAMES_PER_SPK:
                     T_single = MAX_FRAMES_PER_SPK
-                
+
                 T_total = T_single * n_src
 
-                # Extract Oracle STNO matrix with strict dimension handling
                 if tgt.ndim == 4:
-                    # tgt shape: [B, n_src, T_single_orig, D]
-                    d_st = (tgt.abs().sum(dim=-1) > 1e-4).float()
-                    d_st = d_st[:, :, :T_single]
-                    
                     tgt_flat = rearrange(tgt, "b s t d -> b (s t) d")
                     cond_flat = torch.repeat_interleave(cond, repeats=n_src, dim=1)
                 else:
-                    # tgt shape: [B, T_total_orig, D]
-                    d_st_total = (tgt.abs().sum(dim=-1) > 1e-4).float()
-                    d_st_total = d_st_total[:, :T_total]
-                    
-                    # Reshape to [B, n_src, T_single] safely before Eq.(1) formulation
-                    d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
-                    
                     tgt_flat = tgt
                     cond_flat = cond
-                
+
                 # Slice time dimensions to the target T_total limit
                 tgt_flat = tgt_flat[:, :T_total, :]
                 cond_flat = cond_flat[:, :T_total, :]
 
-                with torch.no_grad():
-                    # Compute STNO probabilities strictly following Eq. (1) for eval consistency
-                    p_S = torch.prod(1.0 - d_st, dim=1, keepdim=True) # [B, 1, T_single]
-                    
-                    p_T_list, p_N_list, p_O_list = [], [], []
-                    for s_k in range(n_src):
-                        d_sk = d_st[:, s_k:s_k+1, :]
-                        mask_other = torch.ones_like(d_st)
-                        mask_other[:, s_k, :] = 0.0
-                        p_other = torch.prod(1.0 - (d_st * mask_other), dim=1, keepdim=True)
-                        
-                        p_T_sk = d_sk * p_other
-                        p_O_sk = d_sk * (1.0 - p_other)
-                        p_N_sk = (1.0 - p_S) - p_T_sk - p_O_sk
-                        
-                        p_T_list.append(p_T_sk)
-                        p_N_list.append(p_N_sk)
-                        p_O_list.append(p_O_sk)
-                        
-                    p_T = torch.cat(p_T_list, dim=1)
-                    p_N = torch.cat(p_N_list, dim=1)
-                    p_O = torch.cat(p_O_list, dim=1)
-
-                    # Flatten STNO conditions to align with time-concatenated slots
-                    p_T_flat = rearrange(p_T, "b s t -> b (s t)").unsqueeze(-1)
-                    p_N_flat = rearrange(p_N, "b s t -> b (s t)").unsqueeze(-1)
-                    p_O_flat = rearrange(p_O, "b s t -> b (s t)").unsqueeze(-1)
-
-                # Normalize (no input-space STNO multiplication; condition pathway used instead)
                 norm_cond = (cond_flat - config.audio.norm_mean) / config.audio.norm_std
                 norm_tgt  = (tgt_flat  - config.audio.norm_mean) / config.audio.norm_std
 
@@ -363,16 +294,8 @@ def compute_eval_stats(
                 z       = (1.0 - (1.0 - sigma) * t_bc) * noise + t_bc * norm_tgt
                 vel_tgt = norm_tgt - (1.0 - sigma) * noise
 
-                stno_condition = None
-                if stno_proj is not None:
-                    slot_id_e = make_slot_id(B_orig, n_src, T_single, device)
-                    stno_condition = stno_proj(
-                        p_T_flat.squeeze(-1), p_N_flat.squeeze(-1),
-                        p_O_flat.squeeze(-1), slot_id_e,
-                    )
-
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    pred = predictor(audio=norm_cond, noise=z, times=u, condition=stno_condition)
+                    pred = predictor(audio=norm_cond, noise=z, times=u)
                 
                 # Compute MSE loss based on time-concatenated 1:1 Target Speaker Extraction
                 loss = F.mse_loss(pred.float(), vel_tgt.float())
@@ -385,8 +308,6 @@ def compute_eval_stats(
 
     pred_all = torch.cat(pred_bufs) if pred_bufs else torch.tensor([0.0])
     tgt_all  = torch.cat(tgt_bufs)  if tgt_bufs  else torch.tensor([0.0])
-    if stno_proj is not None:
-        stno_proj.train()
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -521,7 +442,7 @@ def load_datasets(batch_size: int, val_cap: int = VAL_SAMPLES_PER_NSRC):
     train_loaders: Dict[int, DataLoader] = {}
     val_loaders:   Dict[int, DataLoader] = {}
     for n in N_SRC_LIST:
-        setting = f"librittskor{n}"
+        setting = f"mussed{n}"
         ds_tr = make_dataset(setting=setting, cache_path="/tmp", subset="train")
         ds_va = make_dataset(setting=setting, cache_path="/tmp", subset="dev")
         if len(ds_va) > val_cap:
@@ -605,227 +526,14 @@ def eval_mel_sisnri(backbone, val_loaders: dict, device, n_eval: int = HP_SEARCH
     return total_sisnri / max(1, n_total)
 
 
-def eval_mel_sisnri_stage2(
-    backbone, stno_proj, val_loaders: dict, device, n_eval: int = HP_SEARCH_EVAL_N
-) -> float:
-    """Stage-2 version of eval_mel_sisnri: applies oracle STNO conditioning so the
-    HP-search metric is consistent with how the backbone is actually trained in Stage 2.
-    Still operates in normalized-mel space (faster, no vocoder), so numbers will be
-    higher than waveform SI-SNRi, but HP rankings will be valid."""
-    backbone.eval()
-    if stno_proj is not None:
-        stno_proj.eval()
-    sisnr_m      = ScaleInvariantSignalNoiseRatio().to(device)
-    total_sisnri = 0.0
-    n_total      = 0
-    T_cap        = 300
-
-    with torch.no_grad():
-        for n_src, val_loader in val_loaders.items():
-            val_iter = iter(val_loader)
-            for _ in range(min(n_eval, len(val_loader.dataset))):
-                try:
-                    condition_spec, flow_target, *_ = next(val_iter)
-                except StopIteration:
-                    break
-                cond = condition_spec[0:1].to(device)
-                tgt  = flow_target[0:1].to(device)
-
-                if tgt.ndim == 4:
-                    T_single = min(tgt.shape[2], T_cap)
-                    tgt  = rearrange(tgt,  "b s t d -> b (s t) d")
-                    cond = torch.repeat_interleave(cond, repeats=n_src, dim=1)
-                else:
-                    T_single = min(cond.shape[1] // n_src, T_cap)
-
-                T_total = T_single * n_src
-                cond = cond[:, :T_total, :]
-                tgt  = tgt[:, :T_total, :]
-
-                # Oracle STNO — identical formulation to run_training Stage 2
-                d_st_total = (tgt.abs().sum(dim=-1) > 1e-4).float()
-                d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
-                p_S  = torch.prod(1.0 - d_st, dim=1, keepdim=True)
-                p_T_list, p_N_list, p_O_list = [], [], []
-                for s_k in range(n_src):
-                    d_sk  = d_st[:, s_k:s_k+1, :]
-                    mo    = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
-                    p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
-                    p_T_list.append(d_sk * p_oth)
-                    p_O_list.append(d_sk * (1.0 - p_oth))
-                    p_N_list.append((1.0 - p_S) - d_sk * p_oth - d_sk * (1.0 - p_oth))
-                p_T_flat = rearrange(torch.cat(p_T_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
-                p_N_flat = rearrange(torch.cat(p_N_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
-                p_O_flat = rearrange(torch.cat(p_O_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
-
-                norm_cond = (cond - config.audio.norm_mean) / config.audio.norm_std
-                norm_tgt  = (tgt  - config.audio.norm_mean) / config.audio.norm_std
-
-                stno_condition = None
-                if stno_proj is not None:
-                    slot_id = make_slot_id(1, n_src, T_single, device)
-                    stno_condition = stno_proj(
-                        p_T_flat.squeeze(-1), p_N_flat.squeeze(-1),
-                        p_O_flat.squeeze(-1), slot_id,
-                    )
-
-                z = torch.randn_like(norm_cond)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    for step_i in range(16):
-                        t_b = torch.full((1,), step_i / 16, device=device, dtype=torch.bfloat16)
-                        v   = backbone(
-                            audio=norm_cond.to(torch.bfloat16),
-                            noise=z.to(torch.bfloat16),
-                            times=t_b,
-                            condition=stno_condition,
-                        )
-                        z = z + v.float() * (1.0 / 16)
-
-                pred_slots = [z[0, s*T_single:(s+1)*T_single, :].flatten() for s in range(n_src)]
-                tgt_slots  = [norm_tgt[0, s*T_single:(s+1)*T_single, :].float().flatten() for s in range(n_src)]
-                mix_ref    = norm_cond[0, :T_single, :].float().flatten()
-
-                cost = np.zeros((n_src, n_src))
-                for pi in range(n_src):
-                    for ti in range(n_src):
-                        cost[pi, ti] = -sisnr_m(pred_slots[pi], tgt_slots[ti]).item()
-                pi_idx, ti_idx = linear_sum_assignment(cost)
-                for pi, ti in zip(pi_idx, ti_idx):
-                    total_sisnri += (
-                        sisnr_m(pred_slots[pi], tgt_slots[ti]).item()
-                        - sisnr_m(mix_ref,        tgt_slots[ti]).item()
-                    )
-                    n_total += 1
-
-    del sisnr_m
-    gc.collect()
-    torch.cuda.empty_cache()
-    if stno_proj is not None:
-        stno_proj.train()
-    return total_sisnri / max(1, n_total)
-
-
-def eval_waveform_sisnri_stage2(
-    backbone, stno_proj, val_loaders: dict, device, n_eval: int = HP_SEARCH_EVAL_N
-) -> float:
-    """Option B: true waveform SI-SNRi with oracle STNO conditioning.
-    Decodes model output through BigVSAN vocoder for accurate waveform-space metrics.
-    Falls back to eval_mel_sisnri_stage2 if vocoder is unavailable."""
-    vocoder = get_vocoder(device)
-    if vocoder is None:
-        print("[WARN] Vocoder unavailable — falling back to mel-SI-SNRi")
-        return eval_mel_sisnri_stage2(backbone, stno_proj, val_loaders, device, n_eval)
-
-    backbone.eval()
-    if stno_proj is not None:
-        stno_proj.eval()
-    sisnr_m      = ScaleInvariantSignalNoiseRatio().to(device)
-    total_sisnri = 0.0
-    n_total      = 0
-    T_cap        = 300
-
-    with torch.no_grad():
-        for n_src, val_loader in val_loaders.items():
-            val_iter = iter(val_loader)
-            for _ in range(min(n_eval, len(val_loader.dataset))):
-                try:
-                    condition_spec, flow_target, *_ = next(val_iter)
-                except StopIteration:
-                    break
-                cond = condition_spec[0:1].to(device)
-                tgt  = flow_target[0:1].to(device)
-
-                if tgt.ndim == 4:
-                    T_single = min(tgt.shape[2], T_cap)
-                    tgt  = rearrange(tgt,  "b s t d -> b (s t) d")
-                    cond = torch.repeat_interleave(cond, repeats=n_src, dim=1)
-                else:
-                    T_single = min(cond.shape[1] // n_src, T_cap)
-
-                T_total = T_single * n_src
-                cond = cond[:, :T_total, :]
-                tgt  = tgt[:, :T_total, :]
-
-                # Oracle STNO — identical to run_training Stage 2
-                d_st_total = (tgt.abs().sum(dim=-1) > 1e-4).float()
-                d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
-                p_S  = torch.prod(1.0 - d_st, dim=1, keepdim=True)
-                p_T_list, p_N_list, p_O_list = [], [], []
-                for s_k in range(n_src):
-                    d_sk  = d_st[:, s_k:s_k+1, :]
-                    mo    = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
-                    p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
-                    p_T_list.append(d_sk * p_oth)
-                    p_O_list.append(d_sk * (1.0 - p_oth))
-                    p_N_list.append((1.0 - p_S) - d_sk * p_oth - d_sk * (1.0 - p_oth))
-                p_T_flat = rearrange(torch.cat(p_T_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
-                p_N_flat = rearrange(torch.cat(p_N_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
-                p_O_flat = rearrange(torch.cat(p_O_list, dim=1), "b s t -> b (s t)").unsqueeze(-1)
-
-                norm_cond = (cond - config.audio.norm_mean) / config.audio.norm_std
-
-                stno_condition = None
-                if stno_proj is not None:
-                    slot_id = make_slot_id(1, n_src, T_single, device)
-                    stno_condition = stno_proj(
-                        p_T_flat.squeeze(-1), p_N_flat.squeeze(-1),
-                        p_O_flat.squeeze(-1), slot_id,
-                    )
-
-                z = torch.randn_like(norm_cond)
-                with torch.amp.autocast("cuda", dtype=torch.bfloat16):
-                    for step_i in range(16):
-                        t_b = torch.full((1,), step_i / 16, device=device, dtype=torch.bfloat16)
-                        v   = backbone(
-                            audio=norm_cond.to(torch.bfloat16),
-                            noise=z.to(torch.bfloat16),
-                            times=t_b,
-                            condition=stno_condition,
-                        )
-                        z = z + v.float() * (1.0 / 16)
-
-                # Denormalize predicted mel and decode to waveform
-                pred_raw = z.float() * config.audio.norm_std + config.audio.norm_mean
-                pred_wavs = [do_vocoder(pred_raw[0, s*T_single:(s+1)*T_single, :], vocoder, device)
-                             for s in range(n_src)]
-                tgt_wavs  = [do_vocoder(tgt[0, s*T_single:(s+1)*T_single, :].float(), vocoder, device)
-                             for s in range(n_src)]
-                mix_wav   = do_vocoder(cond[0, :T_single, :].float(), vocoder, device)
-
-                min_len = min(min(w.shape[-1] for w in pred_wavs),
-                              min(w.shape[-1] for w in tgt_wavs), mix_wav.shape[-1])
-                pred_wavs = [w[:min_len] for w in pred_wavs]
-                tgt_wavs  = [w[:min_len] for w in tgt_wavs]
-                mix_wav   = mix_wav[:min_len]
-
-                cost = np.zeros((n_src, n_src))
-                for pi in range(n_src):
-                    for ti in range(n_src):
-                        cost[pi, ti] = -sisnr_m(pred_wavs[pi], tgt_wavs[ti]).item()
-                pi_idx, ti_idx = linear_sum_assignment(cost)
-                for pi, ti in zip(pi_idx, ti_idx):
-                    total_sisnri += (
-                        sisnr_m(pred_wavs[pi], tgt_wavs[ti]).item()
-                        - sisnr_m(mix_wav,     tgt_wavs[ti]).item()
-                    )
-                    n_total += 1
-
-    del sisnr_m
-    gc.collect()
-    torch.cuda.empty_cache()
-    if stno_proj is not None:
-        stno_proj.train()
-    return total_sisnri / max(1, n_total)
-
-
 # -----------------------------------------------------------------
 # Core training loop
 # -----------------------------------------------------------------
 def run_training(
-    stage: int, hp: Dict[str, Any], steps: int, eval_every: int, save_every: int,
+    hp: Dict[str, Any], steps: int, eval_every: int, save_every: int,
     train_loaders: dict, val_loaders: dict, device: torch.device,
     experiment_name: str, save_path: Path, accelerator=None, trial=None,
-    full_eval: bool = False, pretrained_path: Optional[Path] = None, stage1_ckpt: Optional[Path] = None,
+    full_eval: bool = False, pretrained_path: Optional[Path] = None,
 ) -> float:
     try:
         torch.serialization.add_safe_globals([np.core.multiarray.scalar])
@@ -839,37 +547,10 @@ def run_training(
     if Path(init_path).exists():
         _load_pretrained_backbone(backbone, Path(init_path))
 
-    if stage == 2 and stage1_ckpt and Path(stage1_ckpt).exists():
-        ckpt = torch.load(str(stage1_ckpt), map_location="cpu", weights_only=False)
-        backbone_key = next((k for k in ("backbone", "backbone_frozen", "model") if k in ckpt), None)
-        if backbone_key:
-            raw_sd = ckpt[backbone_key]
-            if all(k.startswith("flow.") for k in raw_sd):
-                raw_sd = {k[len("flow."):]: v for k, v in raw_sd.items()}
-            backbone.load_state_dict(raw_sd)
-            print(f"[Stage 2] Backbone loaded from {Path(stage1_ckpt).name} (will fine-tune at 0.1× LR)")
-        if "uq_head" in ckpt:
-            uq_head.load_state_dict(ckpt["uq_head"])
-
-    stno_proj = None
-    if stage == 1:
-        backbone.train()
-        uq_head.train()
-        print(f"Stage 1 backbone: {sum(p.numel() for p in backbone.parameters()):,}, "
-              f"UQ head: {sum(p.numel() for p in uq_head.parameters()):,}")
-    else:
-        backbone.train()
-        uq_head.train()
-        stno_proj = STNOProjection(config.model.n_dim).to(device)
-        stno_proj.train()
-        if stage1_ckpt:
-            ckpt_tmp = torch.load(str(stage1_ckpt), map_location="cpu", weights_only=False)
-            if "stno_proj" in ckpt_tmp:
-                stno_proj.load_state_dict(ckpt_tmp["stno_proj"])
-                print("[Stage 2] STNOProjection loaded from stage1 ckpt")
-        print(f"Stage 2 backbone: {sum(p.numel() for p in backbone.parameters()):,}, "
-              f"UQ head: {sum(p.numel() for p in uq_head.parameters()):,}, "
-              f"stno_proj: {sum(p.numel() for p in stno_proj.parameters()):,}")
+    backbone.train()
+    uq_head.train()
+    print(f"Backbone: {sum(p.numel() for p in backbone.parameters()):,}, "
+          f"UQ head: {sum(p.numel() for p in uq_head.parameters()):,}")
 
     lr_max       = hp["lr_max"]
     lr_start     = hp.get("lr_start", lr_max * 0.01)
@@ -882,43 +563,24 @@ def run_training(
         lr_max   *= accelerator.num_processes
         lr_start *= accelerator.num_processes
 
-    if stage == 1:
-        optim = torch.optim.AdamW(
-            [
-                {"params": list(backbone.parameters()), "lr": lr_max},
-                {"params": list(uq_head.parameters()),  "lr": lr_max},
-            ],
-            betas=[0.9, 0.99], weight_decay=0.01, eps=1e-7,
-        )
-    else:
-        optim = torch.optim.AdamW(
-            [
-                {"params": list(backbone.parameters()), "lr": lr_max * 0.5},
-                {"params": list(uq_head.parameters()), "lr": lr_max},
-                {"params": list(stno_proj.parameters()), "lr": lr_max * 0.5},
-            ],
-            betas=[0.9, 0.99], weight_decay=0.01, eps=1e-7,
-        )
+    optim = torch.optim.AdamW(
+        [
+            {"params": list(backbone.parameters()), "lr": lr_max},
+            {"params": list(uq_head.parameters()),  "lr": lr_max},
+        ],
+        betas=[0.9, 0.99], weight_decay=0.01, eps=1e-7,
+    )
     _warmup = torch.optim.lr_scheduler.LinearLR(optim, start_factor=max(lr_start / lr_max, 1e-9), end_factor=1.0, total_iters=warmup_steps)
-    if stage == 2:
-        _plateau = None
-        _cosine  = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=max(steps - warmup_steps, 1), eta_min=lr_start)
-    else:
-        _plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="max", factor=0.5, patience=10, min_lr=lr_start * 10, threshold=0.1)
-        _cosine  = None
+    _plateau = torch.optim.lr_scheduler.ReduceLROnPlateau(optim, mode="max", factor=0.5, patience=10, min_lr=lr_start * 10, threshold=0.1)
 
     if accelerator is not None:
         all_loaders = list(train_loaders.values())
-        if stno_proj is not None:
-            backbone, uq_head, stno_proj, optim, *prep = accelerator.prepare(backbone, uq_head, stno_proj, optim, *all_loaders)
-        else:
-            backbone, uq_head, optim, *prep = accelerator.prepare(backbone, uq_head, optim, *all_loaders)
+        backbone, uq_head, optim, *prep = accelerator.prepare(backbone, uq_head, optim, *all_loaders)
         train_loaders = {n: prep[i] for i, n in enumerate(N_SRC_LIST)}
 
     train_cycles   = {n: cycle(ldr) for n, ldr in train_loaders.items()}
-    best_si_snri   = float("-inf")   # Stage 1
-    best_eval_loss = float("inf")    # Stage 2
-    no_improve_evals = 0             # early stopping counter (Stage 1 only)
+    best_si_snri   = float("-inf")
+    no_improve_evals = 0             # early stopping counter
     warmup_done    = 0
     step           = 0
 
@@ -932,9 +594,6 @@ def run_training(
                 raw_uq = uq_head  if accelerator is None else accelerator.unwrap_model(uq_head)
                 raw_bb.load_state_dict(ckpt.get("backbone", raw_bb.state_dict()))
                 raw_uq.load_state_dict(ckpt.get("uq_head",  raw_uq.state_dict()))
-                if stno_proj is not None:
-                    raw_proj = accelerator.unwrap_model(stno_proj) if accelerator is not None else stno_proj
-                    raw_proj.load_state_dict(ckpt.get("stno_proj", raw_proj.state_dict()))
                 optim.load_state_dict(ckpt["optimizer"])
                 try:
                     _warmup.load_state_dict(ckpt.get("scheduler", {}))
@@ -942,35 +601,17 @@ def run_training(
                     pass
                 if "plateau" in ckpt and _plateau is not None:
                     _plateau.load_state_dict(ckpt["plateau"])
-                # Do NOT load cosine state: accumulated scheduler bug caused last_epoch >> expected.
-                # Instead, reset optimizer LRs and create a fresh cosine for the remaining steps.
                 step           = ckpt.get("step", 0)
                 best_si_snri   = ckpt.get("best_si_snri",   float("-inf"))
-                best_eval_loss = ckpt.get("best_eval_loss", float("inf"))
                 warmup_done    = min(step, warmup_steps)
-                if stage == 2 and step > 0:
-                    # Restore correct LRs (optimizer state has whatever corrupted LR was last set)
-                    init_lrs = [lr_max * 0.5, lr_max, lr_max * 0.5]
-                    for pg, new_lr in zip(optim.param_groups, init_lrs):
-                        pg["lr"] = new_lr
-                    remaining = max(steps - step, 1)
-                    _cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                        optim, T_max=remaining, eta_min=lr_start
-                    )
-                    print(f"  Reset cosine: fresh decay over {remaining} remaining steps, backbone_lr={init_lrs[0]:.2e}")
-                if stage == 2:
-                    print(f"  Resumed at step {step}, best eval_loss: {best_eval_loss:.4f}")
-                else:
-                    print(f"  Resumed at step {step}, best SI-SNRi: {best_si_snri:.2f} dB")
+                print(f"  Resumed at step {step}, best SI-SNRi: {best_si_snri:.2f} dB")
                 break
 
-    pbar = tqdm(initial=step, total=steps, desc=f"Stage {stage} [{experiment_name}]")
+    pbar = tqdm(initial=step, total=steps, desc=f"[{experiment_name}]")
 
     while step < steps:
         backbone.train()
         uq_head.train()
-        if stno_proj is not None:
-            stno_proj.train()
 
         start = time.time()
         last_predicted = None
@@ -1023,132 +664,27 @@ def run_training(
                     noise_state  = ((1.0 - (1.0 - sigma) * t_bcast) * source_noise + t_bcast * norm_target)
                     vel_target = norm_target - (1.0 - sigma) * source_noise
 
-                    if stage == 1:
-                        # Entropy map: up-weight frames near speaker turn transitions
-                        with torch.no_grad():
-                            act = (flow_target_flat.abs().sum(dim=-1) > 1e-5).float()
-                            diff = torch.zeros_like(act)
-                            diff[:, 1:] = (act[:, 1:] - act[:, :-1]).abs()
-                            entropy_map = F.max_pool1d(
-                                diff.unsqueeze(1), kernel_size=15, stride=1, padding=7
-                            ).squeeze(1)
-                        loss_weight = loss_mask.float() * (1.0 + 1.0 * entropy_map)
+                    # Entropy map: up-weight frames near speaker turn transitions
+                    with torch.no_grad():
+                        act = (flow_target_flat.abs().sum(dim=-1) > 1e-5).float()
+                        diff = torch.zeros_like(act)
+                        diff[:, 1:] = (act[:, 1:] - act[:, :-1]).abs()
+                        entropy_map = F.max_pool1d(
+                            diff.unsqueeze(1), kernel_size=15, stride=1, padding=7
+                        ).squeeze(1)
+                    loss_weight = loss_mask.float() * (1.0 + 1.0 * entropy_map)
 
-                        # Backbone: entropy-weighted PIT MSE
-                        predicted = backbone(audio=norm_cond, noise=noise_state, times=times_raw)
-                        bb_loss = pit_mse_loss(predicted, vel_target, n_src, mask=loss_weight)
+                    # Backbone: entropy-weighted PIT MSE
+                    predicted = backbone(audio=norm_cond, noise=noise_state, times=times_raw)
+                    bb_loss = pit_mse_loss(predicted, vel_target, n_src, mask=loss_weight)
 
-                        # UQ head: PIT NLL — detached backbone output keeps gradient paths clean
-                        pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw)
-                        pred_log_sigma = torch.clamp(pred_log_sigma, min=-2.0, max=2.0)
-                        nll_loss = pit_nll_loss(predicted.detach(), pred_log_sigma, vel_target, n_src, mask=loss_weight)
+                    # UQ head: PIT NLL — detached backbone output keeps gradient paths clean
+                    pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw)
+                    pred_log_sigma = torch.clamp(pred_log_sigma, min=-2.0, max=2.0)
+                    nll_loss = pit_nll_loss(predicted.detach(), pred_log_sigma, vel_target, n_src, mask=loss_weight)
 
-                        loss = (bb_loss + 0.2 * nll_loss) / grad_accum
-                    # else:
-                    #     with torch.no_grad():
-                    #         raw_mask = (flow_target.abs().sum(dim=-1) > 1e-4).float()
-                    #         raw_mask = raw_mask[:, :, :T_single]
-                    #         diarization_mask = rearrange(raw_mask, "b s t -> b (s t)")
-                    #         diarization_mask = diarization_mask.unsqueeze(-1)
+                    loss = (bb_loss + 0.2 * nll_loss) / grad_accum
 
-                    #     # Condition (diarization mask) to encoder
-                    #     condition_spec_flat = condition_spec_flat * (1.0 + 0.1 * diarization_mask)
-                    #     # Update normalization and weights
-                    #     norm_cond = (condition_spec_flat - config.audio.norm_mean) / config.audio.norm_std
-
-                    #     # Model forward
-                    #     with torch.no_grad():
-                    #         pred_mean = backbone(audio=norm_cond, noise=noise_state, times=times_raw)
-                    #     pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw)
-                    #     pred_log_sigma = torch.clamp(pred_log_sigma, min=-8.0, max=4.0)
-                        
-                    #     # Detect where speakers changes
-                    #     with torch.no_grad():
-                    #         diff = torch.zeros_like(diarization_mask)
-                    #         diff[:, 1:, :] = torch.abs(diarization_mask[:, 1:, :] - diarization_mask[:, :-1, :])
-                    #         # Expand entropy Map
-                    #         entropy_map = F.max_pool1d(diff.transpose(1, 2), kernel_size=15, stride=1, padding=7).transpose(1, 2)
-                        
-                    #     # Loss Weight Map
-                    #     alpha_weight = 0.5
-                    #     loss_weight_mask = loss_mask.float() * (1.0 + alpha_weight * entropy_map.squeeze(-1))
-
-                    #     # Entropy-Weighted PIT NLL Loss
-                    #     loss = pit_nll_loss(pred_mean, pred_log_sigma, vel_target, n_src, loss_weight_mask)
-                    #     loss = loss / grad_accum
-                    
-                    else:
-                        # Compute oracle STNO mask from ground-truth activity
-                        with torch.no_grad():
-                            if flow_target.ndim == 4:
-                                d_st = (flow_target.abs().sum(dim=-1) > 1e-4).float()
-                                d_st = d_st[:, :, :T_single]
-                            else:
-                                d_st_total = (flow_target.abs().sum(dim=-1) > 1e-4).float()
-                                d_st_total = d_st_total[:, :n_src * T_single]
-                                d_st = rearrange(d_st_total, "b (s t) -> b s t", s=n_src, t=T_single)
-
-                            p_S = torch.prod(1.0 - d_st, dim=1, keepdim=True)
-                            p_T_list, p_N_list, p_O_list = [], [], []
-                            for s_k in range(n_src):
-                                d_sk = d_st[:, s_k:s_k+1, :]
-                                mask_other = torch.ones_like(d_st)
-                                mask_other[:, s_k, :] = 0.0
-                                p_other = torch.prod(1.0 - (d_st * mask_other), dim=1, keepdim=True)
-                                p_T_sk = d_sk * p_other
-                                p_O_sk = d_sk * (1.0 - p_other)
-                                p_N_sk = (1.0 - p_S) - p_T_sk - p_O_sk
-                                p_T_list.append(p_T_sk)
-                                p_N_list.append(p_N_sk)
-                                p_O_list.append(p_O_sk)
-                            p_T = torch.cat(p_T_list, dim=1)
-                            p_N = torch.cat(p_N_list, dim=1)
-                            p_O = torch.cat(p_O_list, dim=1)
-                            p_T_flat = rearrange(p_T, "b s t -> b (s t)").unsqueeze(-1)
-                            p_N_flat = rearrange(p_N, "b s t -> b (s t)").unsqueeze(-1)
-                            p_O_flat = rearrange(p_O, "b s t -> b (s t)").unsqueeze(-1)
-
-                        # Normalize without input-space STNO; condition injected into hidden space below
-                        norm_cond = (condition_spec_flat - config.audio.norm_mean) / config.audio.norm_std
-
-                        # Project STNO features into backbone hidden space (B, T, n_dim).
-                        # Noise augmentation (σ=0.1) simulates PyAnnote frame errors so the model
-                        # doesn't overfit to perfect oracle masks.
-                        slot_id = make_slot_id(norm_cond.shape[0], n_src, T_single, device)
-                        _aug = 0.1
-                        p_T_aug = (p_T_flat.squeeze(-1) + torch.randn_like(p_T_flat.squeeze(-1)) * _aug).clamp(0, 1)
-                        p_N_aug = (p_N_flat.squeeze(-1) + torch.randn_like(p_N_flat.squeeze(-1)) * _aug).clamp(0, 1)
-                        p_O_aug = (p_O_flat.squeeze(-1) + torch.randn_like(p_O_flat.squeeze(-1)) * _aug).clamp(0, 1)
-                        stno_condition = stno_proj(p_T_aug, p_N_aug, p_O_aug, slot_id)
-
-                        # Direct MSE: STNO condition fixes permutation; no PIT needed
-                        pred_mean = backbone(audio=norm_cond, noise=noise_state, times=times_raw,
-                                             condition=stno_condition)
-
-                        # Entropy weight: up-weight speaker-transition frames where separation is hardest
-                        with torch.no_grad():
-                            diff = torch.zeros_like(p_T_flat)
-                            diff[:, 1:, :] = torch.abs(p_T_flat[:, 1:, :] - p_T_flat[:, :-1, :])
-                            entropy_map = F.max_pool1d(diff.transpose(1, 2), kernel_size=15, stride=1, padding=7).transpose(1, 2)
-                        loss_weight = loss_mask.float() * (1.0 + 1.0 * entropy_map.squeeze(-1))
-
-                        loss_per_frame = F.mse_loss(pred_mean.float(), vel_target.float(), reduction='none').mean(dim=-1)
-                        nvalid = loss_weight.sum().clamp(min=1)
-                        bb_loss = (loss_per_frame * loss_weight).sum() / nvalid
-
-                        # UQ head: NLL trains on its own parameters only.
-                        # stno_condition is detached so nll gradients cannot conflict with bb_loss
-                        # gradients inside stno_proj — both objectives now have clean gradient paths.
-                        pred_log_sigma = uq_head(audio=norm_cond, noise=noise_state, times=times_raw,
-                                                 condition=stno_condition.detach())
-                        pred_log_sigma = torch.clamp(pred_log_sigma, min=-2.0, max=2.0)
-                        var_slots = torch.exp(2.0 * pred_log_sigma)
-                        error_sq = (pred_mean.detach() - vel_target) ** 2
-                        nll_map = error_sq / (2.0 * var_slots) + pred_log_sigma
-                        nll_loss = (nll_map.mean(dim=-1) * loss_weight).sum() / nvalid
-
-                        loss = (bb_loss + 0.2 * nll_loss) / grad_accum
-                        
                     if accelerator is not None:
                         accelerator.backward(loss)
                     else:
@@ -1157,16 +693,12 @@ def run_training(
 
                     # Capture stats from first micro-batch for logging
                     if last_predicted is None:
-                        _p = predicted if stage == 1 else pred_mean
-                        last_predicted = _p.detach().float().cpu()
+                        last_predicted = predicted.detach().float().cpu()
                         last_vel_target = vel_target.detach().float().cpu()
 
                 sync = accelerator.sync_gradients if accelerator is not None else True
                 if sync:
-                    params_to_clip = (
-                        list(backbone.parameters()) + list(uq_head.parameters()) +
-                        (list(stno_proj.parameters()) if stno_proj is not None else [])
-                    )
+                    params_to_clip = list(backbone.parameters()) + list(uq_head.parameters())
                     if accelerator is not None:
                         accelerator.clip_grad_norm_(params_to_clip, clip_norm)
                     else:
@@ -1175,8 +707,6 @@ def run_training(
                     warmup_done += 1
                     if warmup_done <= warmup_steps:
                         _warmup.step()
-                    elif _cosine is not None:
-                        _cosine.step()
                     optim.zero_grad()
                     running_loss += loss_val
                     accum_done   += 1
@@ -1210,39 +740,16 @@ def run_training(
         if step % eval_every == 0:
             raw_bb   = backbone   if accelerator is None else accelerator.unwrap_model(backbone)
             raw_uq   = uq_head    if accelerator is None else accelerator.unwrap_model(uq_head)
-            raw_proj = stno_proj  if accelerator is None else (accelerator.unwrap_model(stno_proj) if stno_proj is not None else None)
 
             if full_eval and accelerator is not None:
-                eval_stats = compute_eval_stats(raw_bb, val_loaders, device, sigma=sigma, n_per_nsrc=20, stno_proj=raw_proj)
+                eval_stats = compute_eval_stats(raw_bb, val_loaders, device, sigma=sigma, n_per_nsrc=20)
                 cur_loss   = eval_stats["eval_loss"]
 
                 if accelerator.is_main_process:
                     accelerator.log(eval_stats, step=step)
 
-                    # if stage == 2:
-                        # if cur_loss < best_eval_loss:
-                        #     best_eval_loss = cur_loss
-                        #     best_path = save_path / f"{experiment_name}.best.pt"
-                        #     torch.save({
-                        #         "backbone":        raw_bb.state_dict(),
-                        #         "uq_head":         raw_uq.state_dict(),
-                        #         "stno_proj":       raw_proj.state_dict() if raw_proj is not None else {},
-                        #         "step":            step,
-                        #         "best_eval_loss":  float(best_eval_loss),
-                        #         "optimizer":       optim.state_dict(),
-                        #         "cosine":          _cosine.state_dict() if _cosine is not None else {},
-                        #     }, str(best_path), _use_new_zipfile_serialization=False)
-                        #     accelerator.print(f"[BEST] eval_loss={best_eval_loss:.4f} at step {step} -> {best_path}")
-
-                    # RC2 fix: branch by stage so Stage 1 uses mel-SI-SNRi (consistent with HP search),
-                    # not eval_waveform_sisnri_stage2 which was wrongly called for all stages.
-                    # was: si_snri = eval_waveform_sisnri_stage2(raw_bb, raw_proj, val_loaders, device, n_eval=10)
-                    if stage == 2:
-                        si_snri = eval_waveform_sisnri_stage2(raw_bb, raw_proj, val_loaders, device, n_eval=10)
-                        pbar.write(f"Step {step}: eval_loss={cur_loss:.4f}  SI-SNRi(wave)={si_snri:.2f} dB")
-                    else:
-                        si_snri = eval_mel_sisnri(raw_bb, val_loaders, device, n_eval=100)
-                        pbar.write(f"Step {step}: eval_loss={cur_loss:.4f}  mel-SI-SNRi={si_snri:.2f} dB")
+                    si_snri = eval_mel_sisnri(raw_bb, val_loaders, device, n_eval=100)
+                    pbar.write(f"Step {step}: eval_loss={cur_loss:.4f}  mel-SI-SNRi={si_snri:.2f} dB")
                     accelerator.log({"val/si_snri": si_snri}, step=step)
 
                     prev_best = best_si_snri
@@ -1252,13 +759,10 @@ def run_training(
                         torch.save({
                             "backbone":        raw_bb.state_dict(),
                             "uq_head":         raw_uq.state_dict(),
-                            "stno_proj":       raw_proj.state_dict() if raw_proj is not None else {},
                             "step":            step,
                             "best_si_snri":    float(best_si_snri),
-                            "best_eval_loss":  float(best_eval_loss),
                             "optimizer":       optim.state_dict(),
                             "scheduler":       _warmup.state_dict(),
-                            "cosine":          _cosine.state_dict() if _cosine is not None else {},
                             "plateau":         _plateau.state_dict() if _plateau is not None else {},
                             "hp":              hp,
                         }, str(best_path), _use_new_zipfile_serialization=False)
@@ -1268,8 +772,8 @@ def run_training(
                     if _plateau is not None:
                         _plateau.step(si_snri)
 
-                    # Early stopping (Stage 1 full-training only)
-                    if stage == 1 and full_eval:
+                    # Early stopping (full-training only)
+                    if full_eval:
                         if si_snri >= prev_best + EARLY_STOP_MIN_DELTA_DB:
                             no_improve_evals = 0
                         else:
@@ -1291,13 +795,10 @@ def run_training(
                     torch.save({
                         "backbone":        raw_bb.state_dict(),
                         "uq_head":         raw_uq.state_dict(),
-                        "stno_proj":       raw_proj.state_dict() if raw_proj is not None else {},
                         "step":            step,
                         "best_si_snri":    float(best_si_snri),
-                        "best_eval_loss":  float(best_eval_loss),
                         "optimizer":       optim.state_dict(),
                         "scheduler":       _warmup.state_dict(),
-                        "cosine":          _cosine.state_dict() if _cosine is not None else {},
                         "plateau":         _plateau.state_dict() if _plateau is not None else {},
                         "hp":              hp,
                     }, str(last_path), _use_new_zipfile_serialization=False)
@@ -1305,10 +806,7 @@ def run_training(
                     accelerator.print(f"[LAST] Step {step} -> {last_path}")
 
             else:
-                if stage == 2 and raw_proj is not None:
-                    si_snri = eval_waveform_sisnri_stage2(raw_bb, raw_proj, val_loaders, device)
-                else:
-                    si_snri = eval_mel_sisnri(raw_bb, val_loaders, device)
+                si_snri = eval_mel_sisnri(raw_bb, val_loaders, device)
                 print(f"  [step {step}/{steps}] SI-SNRi={si_snri:.2f} dB  loss={running_loss / grad_accum:.4f}  lr={optim.param_groups[0]['lr']:.2e}")
                 if _plateau is not None:
                     _plateau.step(si_snri)
@@ -1320,7 +818,6 @@ def run_training(
                         torch.save({
                             "backbone":     raw_bb.state_dict(),
                             "uq_head":      raw_uq.state_dict(),
-                            "stno_proj":    raw_proj.state_dict() if raw_proj is not None else {},
                             "step":         step,
                             "best_si_snri": float(best_si_snri),
                             "optimizer":    optim.state_dict(),
@@ -1328,7 +825,7 @@ def run_training(
                         print(f"[BEST] mel-SI-SNRi={best_si_snri:.2f} dB -> {best_path}")
 
             if trial is not None:
-                trial_val = si_snri  # mel-SI-SNRi for both stages (with STNO for stage 2)
+                trial_val = si_snri  # mel-SI-SNRi
                 trial.report(trial_val, step)
                 if trial.should_prune():
                     pbar.close()
@@ -1337,37 +834,9 @@ def run_training(
             gc.collect()
             torch.cuda.empty_cache()
 
-        # Storage fix: removed step-based checkpoint saves — only .last.pt (every eval) and .best.pt survive
-        # was: _save_now = (step in save_every) if isinstance(save_every, (list, tuple)) else (step % save_every == 0)
-        # was: if (full_eval and save_path is not None and _save_now and (accelerator is None or accelerator.is_main_process)):
-        #     raw_bb   = backbone  if accelerator is None else accelerator.unwrap_model(backbone)
-        #     raw_uq   = uq_head   if accelerator is None else accelerator.unwrap_model(uq_head)
-        #     raw_proj = stno_proj if accelerator is None else (accelerator.unwrap_model(stno_proj) if stno_proj is not None else None)
-        #     fname  = str(save_path / f"{experiment_name}.{step}.pt")
-        #     payload = {
-        #         "backbone":     raw_bb.state_dict(),
-        #         "uq_head":      raw_uq.state_dict(),
-        #         "stno_proj":    raw_proj.state_dict() if raw_proj is not None else {},
-        #         "step":         step,
-        #         "best_si_snri":   float(best_si_snri),
-        #         "best_eval_loss": float(best_eval_loss),
-        #         "optimizer":      optim.state_dict(),
-        #         "scheduler":      _warmup.state_dict(),
-        #         "cosine":         _cosine.state_dict() if _cosine is not None else {},
-        #         "plateau":        _plateau.state_dict() if _plateau is not None else {},
-        #         "hp":             hp,
-        #     }
-        #     torch.save(payload, fname, _use_new_zipfile_serialization=False)
-        #     shutil.copyfile(fname, str(save_path / f"{experiment_name}.pt"))
-        #     pbar.write(f"Step {step}: checkpoint saved")
-        #     print(f"[SAVE] {fname}")
-
         torch.cuda.empty_cache()
 
     pbar.close()
-    # return -best_eval_loss if stage == 2 else best_si_snri
-    # Both stages: return mel-SI-SNRi (maximize). For stage 2 full_eval, best_si_snri
-    # tracks the STNO-conditioned mel-SI-SNRi; best_eval_loss is also saved separately.
     return best_si_snri
 
 
@@ -1386,7 +855,7 @@ def search_stage1(train_loaders: dict, val_loaders: dict, device: torch.device) 
         os.makedirs(trial_save, exist_ok=True)
         try:
             return run_training(
-                stage=1, hp=hp, steps=STAGE1_SEARCH_STEPS, eval_every=STAGE1_SEARCH_EVAL_EVERY,
+                hp=hp, steps=STAGE1_SEARCH_STEPS, eval_every=STAGE1_SEARCH_EVAL_EVERY,
                 save_every=STAGE1_SEARCH_STEPS + 1, train_loaders=train_loaders, val_loaders=val_loaders, device=device,
                 experiment_name=f"trial_{trial.number}", save_path=trial_save, trial=trial, full_eval=False,
             )
@@ -1410,50 +879,6 @@ def search_stage1(train_loaders: dict, val_loaders: dict, device: torch.device) 
         study.optimize(objective, n_trials=remaining, show_progress_bar=True)
     best_trial = study.best_trial
     print(f"\n[Stage 1 Search] Best trial #{best_trial.number}: mel-SI-SNRi={best_trial.value:.2f} dB")
-    best_hp = dict(best_trial.params)
-    best_hp["batch_size"] = 4
-    return best_hp
-
-
-def search_stage2(train_loaders: dict, val_loaders: dict, device: torch.device, stage1_best: Path) -> Dict[str, Any]:
-    def objective(trial: optuna.Trial) -> float:
-        hp = {
-            "lr_max":       trial.suggest_float("lr_max",       1e-7, 1e-4, log=True),
-            "lr_start":     trial.suggest_float("lr_start",     1e-9, 1e-6, log=True),
-            "warmup_steps": trial.suggest_int  ("warmup_steps", 100,  1000),
-            "clip_norm":    trial.suggest_float("clip_norm",    0.05, 2.0,  log=True),
-            "sigma":        trial.suggest_float("sigma",        1e-6, 1e-3, log=True),
-            "batch_size":   4,
-            "grad_accum":   trial.suggest_categorical("grad_accum", [2, 4]),
-        }
-        trial_save = HP_SEARCH_PATH / f"stage2_trial{trial.number}"
-        os.makedirs(trial_save, exist_ok=True)
-        try:
-            return run_training(
-                stage=2, hp=hp, steps=STAGE2_SEARCH_STEPS, eval_every=STAGE2_SEARCH_EVAL_EVERY,
-                save_every=STAGE2_SEARCH_STEPS + 1, train_loaders=train_loaders, val_loaders=val_loaders, device=device,
-                experiment_name=f"s2_trial_{trial.number}", save_path=trial_save, trial=trial, full_eval=False, stage1_ckpt=stage1_best,
-            )
-        except optuna.exceptions.TrialPruned:
-            raise
-        except Exception as e:
-            print(f"[S2 Trial {trial.number}] FAILED: {e}")
-            return float("-inf")
-        finally:
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    study = optuna.create_study(
-        study_name="stage2_hp_search_libri", direction="maximize", sampler=TPESampler(seed=42),
-        pruner=MedianPruner(n_startup_trials=3, n_warmup_steps=STAGE2_SEARCH_EVAL_EVERY),
-        storage=OPTUNA_DB, load_if_exists=True,
-    )
-    study.enqueue_trial({k: v for k, v in MANUAL_STAGE2_HP.items() if k != "batch_size"})
-    remaining = max(0, STAGE2_N_TRIALS - len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]))
-    if remaining > 0:
-        study.optimize(objective, n_trials=remaining, show_progress_bar=True)
-    best_trial = study.best_trial
-    print(f"\n[Stage 2 Search] Best trial #{best_trial.number}: SI-SNRi(wave)={best_trial.value:.2f} dB")
     best_hp = dict(best_trial.params)
     best_hp["batch_size"] = 4
     return best_hp
@@ -1493,43 +918,12 @@ def main():
     accelerator.print("=" * 60)
     accelerator.init_trackers(train_project, config={"stage": 1, **best_s1_hp})
     run_training(
-        stage=1, hp=best_s1_hp, steps=STAGE1_FULL_STEPS, eval_every=STAGE1_FULL_EVAL_EV, save_every=STAGE1_FULL_SAVE_EV,
+        hp=best_s1_hp, steps=STAGE1_FULL_STEPS, eval_every=STAGE1_FULL_EVAL_EV, save_every=STAGE1_FULL_SAVE_EV,
         train_loaders=train_loaders, val_loaders=val_loaders, device=device,
         experiment_name=STAGE1_EXPERIMENT, save_path=STAGE1_SAVE_PATH, accelerator=accelerator, full_eval=True, pretrained_path=PRETRAINED_BACKBONE_PATH,
     )
     accelerator.end_training()
-    accelerator.print("\nStage 1 complete!")
-
-    # -- Stage 2 --
-    stage1_best = STAGE1_SAVE_PATH / f"{STAGE1_EXPERIMENT}.best.pt"
-    # stage1_best = STAGE1_SAVE_PATH / f"{STAGE1_EXPERIMENT}.47500.pt"
-
-    if HP_SEARCH_MODE:
-        accelerator.print("\n" + "=" * 60)
-        accelerator.print("Stage 2 HP search")
-        accelerator.print("=" * 60)
-        best_s2_hp = search_stage2(train_loaders, val_loaders, device, stage1_best)
-        accelerator.print(f"\nBest Stage 2 HPs: {best_s2_hp}")
-    else:
-        best_s2_hp = MANUAL_STAGE2_HP
-        accelerator.print(f"\nUsing manual Stage 2 HPs: {best_s2_hp}")
-
-    ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=True)
-    _ga = best_s2_hp.get("grad_accum", 1)
-    accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs], mixed_precision=TRAIN_MIXED_PRECISION,
-                              gradient_accumulation_steps=_ga)
-    device = accelerator.device
-    accelerator.print("\n" + "=" * 60)
-    accelerator.print("Stage 2 full training")
-    accelerator.print("=" * 60)
-    accelerator.init_trackers(train_project, config={"stage": 2, **best_s2_hp})
-    run_training(
-        stage=2, hp=best_s2_hp, steps=STAGE2_FULL_STEPS, eval_every=STAGE2_FULL_EVAL_EV, save_every=STAGE2_FULL_SAVE_EV,
-        train_loaders=train_loaders, val_loaders=val_loaders, device=device,
-        experiment_name=STAGE2_EXPERIMENT, save_path=STAGE2_SAVE_PATH, accelerator=accelerator, full_eval=True, stage1_ckpt=stage1_best,
-    )
-    accelerator.end_training()
-    accelerator.print("\nStage 2 complete!")
+    accelerator.print("\nTraining complete!")
 
 
 if __name__ == "__main__":

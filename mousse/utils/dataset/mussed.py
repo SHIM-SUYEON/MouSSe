@@ -14,7 +14,7 @@ _LOCAL_SCP_BASE = str(
 )
 
 
-class LibriTTSKORDataset(Dataset):
+class MussedDataset(Dataset):
     def __init__(
         self,
         cache_path: str,

@@ -7,7 +7,7 @@ adaptive UQ-guided classifier-free guidance.
 This repository contains the code needed to **train** and **evaluate** the
 model reported in the paper.
 
-## Qualitative examples
+## Examples
 
 Each panel shows the input **mixture** (top) and, per source, the
 **ground-truth** (left) vs. the model's **separated** mel-spectrogram (right),
@@ -32,7 +32,7 @@ MOUSSE/
 │       ├── audio.py             # mel-spectrogram / STFT utilities
 │       ├── misc.py              # dict_to_object
 │       └── dataset/
-│           ├── librittskor.py   # LibriTTS-KOR mixture dataset + collate
+│           ├── mussed.py        # MUSSED mixture dataset + collate
 │           └── scp/             # test-set manifests (2spk / 3spk / 4spk)
 ├── training/
 │   └── train.py                # single-stage PIT + UQ + entropy-weighted training
@@ -70,11 +70,11 @@ scp/<N>spk/
   tt_s1.scp ...      # per-source targets
 ```
 
-The paths inside the manifests point to the private LibriTTS-KOR mixture set
+The paths inside the manifests point to the private MUSSED mixture set
 (`/shared/NAS_HDD/...`). To reproduce on another machine, regenerate the
 mixtures and update the paths in the `.scp` files (or point `scp_base_dir` /
 symlink the audio to those locations). Speaker counts of 2, 3 and 4 are
-selected via the dataset key `librittskor2` / `librittskor3` / `librittskor4`.
+selected via the dataset key `mussed2` / `mussed3` / `mussed4`.
 
 ## Configuration
 
@@ -126,6 +126,6 @@ python inference/eval.py \
     --out results/stage1_uq/backbone_only
 ```
 
-Key flags: `--stage {1,2}`, `--ablation no_stno`, `--lambda-fixed`,
+Key flags: `--stage {1,2}`, `--ablation {full,no_uq,no_entropy}`, `--lambda-fixed`,
 `--lambda-scale`, `--steps`, `--cap`, `--gpu`, `--out`, `--save-wav`. See the
 module docstring in [inference/eval.py](inference/eval.py) for details.

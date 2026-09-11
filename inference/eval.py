@@ -1,47 +1,3 @@
-"""
-Evaluation for the MouSSe single-stage PIT+UQ model (training/train.py).
-
-Checkpoint keys: "backbone" + "uq_head"  (no stno_proj, no oracle STNO).
-Expected SI-SNRi: ~13 dB  (matches validation performance).
-
-Inference modes:
-  --stage 1
-        Backbone-only with fixed CFG (alpha=1.5). No UQ head at inference.
-        This matches what the training validation loop effectively runs.
-  --stage 2 --ablation no_stno
-        UQ head active, condition=None (no STNO). Uses original num/den formula
-        → lambda≈0 always (broken), effectively same as backbone-only.
-  --stage 2 --ablation no_stno --lambda-scale 5.0
-        Adaptive UQ guidance (σ_cond × 5.0).  May give slight improvement.
-
-Usage (run from the repository root):
-    CKPT=/path/to/checkpoint/large-sep-0820.best.pt
-
-    # Backbone-only (stage 1, fixed alpha=1.5) — expected ~13 dB SI-SNRi
-    nohup python3 -u inference/eval.py \
-            --stage 1 --gpu 2,3 \
-            --ckpt "$CKPT" --cap 1300 \
-            --out results/stage1_uq/backbone_only \
-            > eval-backbone.log 2>&1 &
-
-    # Adaptive UQ guidance (no STNO, σ_cond × lambda_scale)
-    nohup python3 -u inference/eval.py \
-            --stage 2 --ablation no_stno --lambda-scale 5.0 --gpu 2,3 \
-            --ckpt "$CKPT" --cap 1300 \
-            --out results/stage1_uq/adaptive_uq \
-            > eval-adaptive.log 2>&1 &
-
-    nohup python3 -u inference/eval.py \
-                --stage 2 --ablation no_stno --lambda-scale 1.0 --gpu 0,1 \
-                --ckpt "$CKPT" --cap 1300 \
-                --out results/stage1_uq_lambda1/main_adaptive_1_0 \
-                > eval-adaptive_1_0_lambda1.log 2>&1 &
-
-    --save-wav    Save separated audio files under out_dir/wav/
-
-Or use the driver script (inference/eval.sh) to reproduce the full paper suite.
-"""
-
 import os
 import sys
 import gc
@@ -83,7 +39,7 @@ from mousse.configs import config
 from mousse.models import AudioFlow, UncertaintyHead
 
 from mousse.utils.dataset import make_dataset
-from mousse.models.patches import STNOProjection, make_slot_id, apply_forward_patches
+from mousse.models.patches import apply_forward_patches
 from mousse.utils.vocoder import get_vocoder, do_vocoder
 from mousse.utils.signal import rms_normalize
 from mousse.utils.reporting import (
@@ -95,46 +51,26 @@ from mousse.utils.reporting import (
 random.seed(42)
 
 DEFAULT_CKPT = Path(
-    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/single-stage/0826/large-sep-0820.best.pt"
-)
-
-DEFAULT_STAGE2_CKPT = Path(
-    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/stage2-trainable-0820-600-0821/large-uq-0820.best.pt"
+    "./mousse/mousse.best.pt"
 )
 
 N_SRC_LIST = [2, 3, 4]
 TEST_CAP = 1300
 EVAL_STEPS = 16
-MAX_FRAMES_PER_SPK = 1500 # 1200
+MAX_FRAMES_PER_SPK = 1500
 PESQ_SR = 16000
 
 # Long sequences are truncated at MAX_FRAMES_PER_SPK; no duration-based skip.
 MAX_MIX_DURATION = float("inf")
 
 # Threshold for detecting active speech frames in the target mel spectrogram.
-# Consistent with compute_stno_condition's activity detection.
 ACTIVE_THRESH = 1e-4
 
 DEFAULT_OUT_DIR = Path(
-    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/results/"
-    "stage1-uq/single-stage-0826/"
+    "./results"
 )
 
 os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
-
-
-# ─── Category accumulator helpers ─────────────────────────────────────────────
-
-
-
-
-
-
-
-# ─── Model / inference helpers (unchanged) ───────────────────────────────────
-
-
-
 
 def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                       lambda_max=2.0, use_uq_guidance=True, condition=None,
@@ -145,7 +81,7 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                   lambda_fixed>0.0 → fixed CFG scale.
     lambda_scale: if set (float), enables the diet/UQ-only formula:
                   lambda* = clamp(sigma_cond.mean * lambda_scale, max=lambda_max)
-                  This is the formula used by 0828-best-diet.py (no sigma_uncond, no STNO).
+                  (UQ-only; no sigma_uncond term).
     """
     device = audio.device
     batch_size = audio.shape[0]
@@ -168,7 +104,6 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                         v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
                         v_guided = v_cond + (v_cond - v_uncond) * lambda_fixed
                 elif use_uq_guidance and lambda_scale is not None:
-                    # Diet/UQ-only formula: lambda* = clamp(sigma_cond.mean * lambda_scale, max)
                     v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
                     log_s_cond   = uq_head(audio=audio,       noise=z, times=t_batch)
                     log_s_uncond = uq_head(audio=audio_empty, noise=z, times=t_batch)
@@ -182,10 +117,11 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                         sigma_cond.mean(dim=-1, keepdim=True) * lambda_scale,
                         max=lambda_max,
                     )
-                    if i == 0: print(f"[UQ-diet] lambda_star step0  mean={lambda_star.mean():.3f}  max={lambda_star.max():.3f}  frac_clamped={(lambda_star >= lambda_max).float().mean():.3f}", flush=True)
+                    if i == 0:
+                        print(f"lambda_star step0  mean={lambda_star.mean():.3f}  max={lambda_star.max():.3f}  frac_clamped={(lambda_star >= lambda_max).float().mean():.3f}", flush=True)
                     v_guided = v_cond + (v_cond - v_uncond) * lambda_star
                 elif use_uq_guidance:
-                    # Original formula: lambda* = clamp(num/den, 0, lambda_max)
+                    # lambda* = clamp(num/den, 0, lambda_max)
                     v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
                     log_s_uncond = uq_head(audio=audio, noise=z, times=t_batch)
                     log_s_cond = uq_head(audio=audio, noise=z, times=t_batch, condition=condition)
@@ -196,7 +132,8 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                     num = torch.sum(sigma_uncond * sigma_cond - sigma_cond ** 2, dim=-1, keepdim=True)
                     den = torch.sum((sigma_cond - sigma_uncond) ** 2, dim=-1, keepdim=True).clamp(min=1e-8)
                     lambda_star = torch.clamp(num / den, min=0.0, max=lambda_max)
-                    if i == 0: print(f"[UQ] lambda_star step0  mean={lambda_star.mean():.3f}  max={lambda_star.max():.3f}  frac_clamped={( lambda_star >= lambda_max).float().mean():.3f}", flush=True)
+                    if i == 0:
+                        print(f"lambda_star step0  mean={lambda_star.mean():.3f}  max={lambda_star.max():.3f}  frac_clamped={( lambda_star >= lambda_max).float().mean():.3f}", flush=True)
                     v_guided = v_cond + (v_cond - v_uncond) * lambda_star
                 else:
                     v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
@@ -209,9 +146,6 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
 
 _VOCODER_CACHE = None
 
-
-
-
 def _snr_val(preds: torch.Tensor, target: torch.Tensor) -> float:
     signal = float(target.pow(2).mean())
     noise  = float((preds - target).pow(2).mean())
@@ -219,43 +153,15 @@ def _snr_val(preds: torch.Tensor, target: torch.Tensor) -> float:
         return 40.0
     return 10.0 * math.log10(max(signal, 1e-8) / noise)
 
-
-def compute_stno_condition(target_flat, n_src, T_per_spk, stno_proj, device):
-    d_st_total = (target_flat.abs().sum(dim=-1) > 1e-4).float()
-    d_st = d_st_total.reshape(1, n_src, T_per_spk)
-    p_S = torch.prod(1.0 - d_st, dim=1, keepdim=True)
-    p_T_list, p_N_list, p_O_list = [], [], []
-    for s_k in range(n_src):
-        d_sk = d_st[:, s_k:s_k+1, :]
-        mo = torch.ones_like(d_st); mo[:, s_k, :] = 0.0
-        p_oth = torch.prod(1.0 - (d_st * mo), dim=1, keepdim=True)
-        p_T_list.append(d_sk * p_oth)
-        p_O_list.append(d_sk * (1.0 - p_oth))
-        p_N_list.append((1.0 - p_S) - d_sk * p_oth - d_sk * (1.0 - p_oth))
-    p_T = torch.cat(p_T_list, dim=1).reshape(1, n_src * T_per_spk)
-    p_N = torch.cat(p_N_list, dim=1).reshape(1, n_src * T_per_spk)
-    p_O = torch.cat(p_O_list, dim=1).reshape(1, n_src * T_per_spk)
-    slot_id = make_slot_id(1, n_src, T_per_spk, device)
-    return stno_proj(p_T, p_N, p_O, slot_id)
-
-
-# ─── Print helpers ────────────────────────────────────────────────────────────
-
-
-
-
-
-# ─── Core evaluation loop ─────────────────────────────────────────────────────
-def _eval_loop(backbone, uq_head, stno_proj, test_loaders, device,
+def _eval_loop(backbone, uq_head, test_loaders, device,
                stage=1, out_dir=None, save_wav=False, ablation='full', eval_steps=None,
                lambda_fixed=None, lambda_scale=None):
     """Run the evaluation loop and return raw accumulators (no printing of final tables)."""
-    # ── Ablation mode banner ──────────────────────────────────────────────────
-    _ABLATION_VALID = ("full", "no_uq", "no_stno", "no_entropy", "no_stno_no_uq")
+
+    _ABLATION_VALID = ("full", "no_uq", "no_entropy")
     if ablation not in _ABLATION_VALID:
         raise ValueError(f"Unknown ablation mode '{ablation}'. Choose from {_ABLATION_VALID}")
-    use_uq_guidance = (stage == 2) and (ablation not in ("no_uq", "no_stno_no_uq"))
-    use_stno        = (stage == 2) and (ablation not in ("no_stno", "no_stno_no_uq"))
+    use_uq_guidance = (stage == 2) and (ablation != "no_uq")
     print(f"\n{'='*70}")
     print(f"  ABLATION MODE : {ablation.upper()}")
     if lambda_fixed is not None:
@@ -264,14 +170,11 @@ def _eval_loop(backbone, uq_head, stno_proj, test_loaders, device,
         print(f"  UQ guidance   : YES — λ*=σ_cond×{lambda_scale} (diet/UQ-only formula, max={2.0})")
     else:
         print(f"  UQ guidance   : {'YES — λ* adaptive (num/den)' if use_uq_guidance else 'NO  — fixed α=1.5'}")
-    print(f"  STNO cond.    : {'YES — oracle' if use_stno else 'NO  — condition=None'}")
     print(f"  Entropy loss  : {'separate no-entropy checkpoint' if ablation == 'no_entropy' else 'standard training'}")
     print(f"{'='*70}\n")
 
     backbone.eval()
     uq_head.eval()
-    if stno_proj is not None:
-        stno_proj.eval()
 
     sr = config.audio.sample_rate
     stoi_m  = ShortTimeObjectiveIntelligibility(fs=sr, extended=False).to(device)
@@ -323,19 +226,12 @@ def _eval_loop(backbone, uq_head, stno_proj, test_loaders, device,
 
             # Build conditioning
             norm_cond = (single_cond - config.audio.norm_mean) / config.audio.norm_std
-            stno_cond = None
-            if use_stno and stno_proj is not None:
-                with torch.no_grad():
-                    stno_cond = compute_stno_condition(
-                        single_target, n_src, T_per_spk, stno_proj, device
-                    )
 
             mix_input = norm_cond.to(dtype=torch.bfloat16)
             sep_spec, sigma_cond_mean, sigma_uncond_mean = fast_euler_sample(
                 backbone, uq_head, mix_input,
                 steps=(eval_steps or EVAL_STEPS), alpha=1.5, lambda_max=2.0,
                 use_uq_guidance=use_uq_guidance,
-                condition=stno_cond.to(dtype=torch.bfloat16) if stno_cond is not None else None,
                 lambda_fixed=lambda_fixed,
                 lambda_scale=lambda_scale,
             )
@@ -411,7 +307,6 @@ def _eval_loop(backbone, uq_head, stno_proj, test_loaders, device,
                     if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], uq=uq_val)
                     # --- Active-frames-only UQ ---
                     # Active mask: frames where target mel energy exceeds ACTIVE_THRESH
-                    # (same criterion as compute_stno_condition's activity detection)
                     tgt_mel = tgt_slots[ti].view(T_per_spk, -1)       # [T, n_mels]
                     active_mask = tgt_mel.abs().sum(dim=-1) > ACTIVE_THRESH  # [T]
                     n_active = active_mask.sum().item()
@@ -812,10 +707,6 @@ def _eval_loop(backbone, uq_head, stno_proj, test_loaders, device,
     return nsrc_acc, cat_acc, per_sample_records
 
 
-# ─── Finalize: print tables + build results dict ──────────────────────────────
-
-
-
 # ─── Checkpoint loading ───────────────────────────────────────────────────────
 def load_checkpoint(ckpt_path, device):
     try:
@@ -845,13 +736,7 @@ def load_checkpoint(ckpt_path, device):
         uq_head.load_state_dict(ckpt["uq_head"])
         print("[CKPT] UQ head loaded")
 
-    stno_proj = None
-    if "stno_proj" in ckpt and ckpt["stno_proj"]:
-        stno_proj = STNOProjection(config.model.n_dim).to(device)
-        stno_proj.load_state_dict(ckpt["stno_proj"])
-        print("[CKPT] STNOProjection loaded")
-
-    return backbone, uq_head, stno_proj
+    return backbone, uq_head
 
 
 # ─── Result saving ────────────────────────────────────────────────────────────
@@ -916,7 +801,7 @@ def _build_test_loaders(args, shard_rank=0, shard_world=1):
     """Build per-n_src DataLoaders, sharded for multi-GPU workers."""
     test_loaders = {}
     for n in N_SRC_LIST:
-        ds = make_dataset(setting=f"librittskor{n}", cache_path="/tmp", subset="test")
+        ds = make_dataset(setting=f"mussed{n}", cache_path="/tmp", subset="test")
         n_total = len(ds)
         n_use = min(args.cap, n_total)
         all_indices = list(range(n_use))[:TEST_CAP + 1]
@@ -1000,7 +885,7 @@ def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world
 
     apply_forward_patches()
     print(f"[EVAL] Loading {ckpt_path} for stage {args.stage}  ablation={args.ablation}")
-    backbone, uq_head, stno_proj = load_checkpoint(ckpt_path, device)
+    backbone, uq_head = load_checkpoint(ckpt_path, device)
 
     print(f"\n[EVAL] Building test loaders (cap={args.cap} per n_src)...")
     test_loaders = _build_test_loaders(args, shard_rank=shard_rank, shard_world=shard_world)
@@ -1010,7 +895,7 @@ def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world
     print(f"[EVAL] Output directory: {out_dir}")
 
     return _eval_loop(
-        backbone, uq_head, stno_proj, test_loaders, device,
+        backbone, uq_head, test_loaders, device,
         stage=args.stage, out_dir=str(out_dir), save_wav=args.save_wav,
         ablation=args.ablation, eval_steps=getattr(args, 'steps', None),
         lambda_fixed=getattr(args, 'lambda_fixed', None),
@@ -1047,7 +932,7 @@ def _eval_one_ckpt(ckpt_path, args, gpu_list, out_dir):
 # ─── Entry point ──────────────────────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate stage-1 separation model on LibriTTS-KOR test set."
+        description="Evaluate stage-1 separation model on MUSSED test set."
     )
     parser.add_argument("--ckpt", default=str(DEFAULT_CKPT),
                         help="Path to .pt checkpoint, OR a directory to evaluate all .pt files inside")
@@ -1055,14 +940,12 @@ def main():
                         help="Single GPU id ('4') or comma-separated list for multi-GPU ('0,1,2,3')")
     parser.add_argument("--stage",   default=2, type=int, choices=[1, 2])
     parser.add_argument("--ablation", default="full",
-                        choices=["full", "no_uq", "no_stno", "no_entropy", "no_stno_no_uq"],
+                        choices=["full", "no_uq", "no_entropy"],
                         help=(
                             "Ablation mode for stage-2 evaluation:\n"
-                            "  full          — oracle STNO + UQ guidance (λ* adaptive)  [full model]\n"
-                            "  no_uq         — oracle STNO, no UQ guidance (fixed α=1.5) [same ckpt]\n"
-                            "  no_stno       — UQ guidance on, STNO condition=None       [same ckpt]\n"
-                            "  no_entropy    — oracle STNO + UQ guidance, but separate   [no-entropy ckpt]\n"
-                            "  no_stno_no_uq — Stage2 backbone only, no STNO, fixed α=1.5 [same ckpt]\n"
+                            "  full          — UQ guidance (λ* adaptive)          [full model]\n"
+                            "  no_uq         — no UQ guidance (fixed α=1.5)        [same ckpt]\n"
+                            "  no_entropy    — UQ guidance, separate no-entropy    [no-entropy ckpt]\n"
                         ))
     parser.add_argument("--cap",     default=TEST_CAP, type=int,
                         help="Max test samples per n_src")
@@ -1082,7 +965,6 @@ def main():
     parser.add_argument("--lambda-scale", type=float, default=None, dest="lambda_scale",
                         help=(
                             "Enable diet/UQ-only guidance formula: λ*=clamp(σ_cond.mean×scale, max=2.0). "
-                            "Use with --ablation no_stno for 0828-best-diet.py checkpoints. "
                             "Typical value: 5.0  (matches training default lambda_scale=5.0)"
                         ))
     # Hidden args used internally by multi-GPU subprocess workers

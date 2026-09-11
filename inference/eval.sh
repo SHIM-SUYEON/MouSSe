@@ -78,7 +78,7 @@ run_adaptive() {
     local tag; tag=$(echo "$scale" | tr '.' '_')
     local log="$LOG_DIR/adaptive_scale_${tag}.log"
     local out="$OUT_BASE/adaptive_scale_${tag}"
-    _run "$log" --ckpt "$CKPT" --stage 2 --ablation no_stno \
+    _run "$log" --ckpt "$CKPT" --stage 2 \
         --lambda-scale "$scale" --gpu "$gpu" --cap "$cap" --out "$out"
 }
 
@@ -86,7 +86,7 @@ run_steps() {
     local steps="$1" scale="$2" gpu="$3" cap="${4:-$CAP_SWEEP}"
     local log="$LOG_DIR/steps_${steps}.log"
     local out="$OUT_BASE/steps_${steps}"
-    _run "$log" --ckpt "$CKPT" --stage 2 --ablation no_stno \
+    _run "$log" --ckpt "$CKPT" --stage 2 \
         --lambda-scale "$scale" --steps "$steps" \
         --gpu "$gpu" --cap "$cap" --out "$out"
 }
@@ -109,7 +109,7 @@ run_main() {
     # Adaptive UQ guidance (lambda_scale=1.5 → lambda* ≈ 0.50)
     LOG_AD="$LOG_DIR/main_adaptive_1_5.log"
     _run "$LOG_AD" \
-        --ckpt "$CKPT" --stage 2 --ablation no_stno --lambda-scale 1.5 \
+        --ckpt "$CKPT" --stage 2 --lambda-scale 1.5 \
         --gpu "$GPU_B" --cap "$CAP_MAIN" \
         --out "$OUT_BASE/main_adaptive_1_5" &
     PID_B=$!
@@ -226,7 +226,7 @@ run_entropy_ablation() {
 
     LOG_NE_AD="$LOG_DIR/no_entropy_adaptive.log"
     _run "$LOG_NE_AD" \
-        --ckpt "$CKPT_NO_ENTROPY" --stage 2 --ablation no_stno --lambda-scale 1.5 \
+        --ckpt "$CKPT_NO_ENTROPY" --stage 2 --lambda-scale 1.5 \
         --gpu "$GPU_B" --cap "$CAP_MAIN" \
         --out "$OUT_BASE/no_entropy_adaptive" &
     PID_B=$!
@@ -246,15 +246,11 @@ run_sigma_analysis() {
 
     LOG_SIG="$LOG_DIR/sigma_sto_analysis.log"
     _run "$LOG_SIG" \
-        --ckpt "$CKPT" --stage 2 --ablation no_stno --lambda-scale 1.5 \
+        --ckpt "$CKPT" --stage 2 --lambda-scale 1.5 \
         --gpu "$GPU_A" --cap "$CAP_MAIN" \
         --out "$OUT_BASE/sigma_sto_analysis"
 
     echo "[sigma] STO sigma analysis done. See $LOG_SIG for [STO-sigma] lines."
-
-    # NOTE: the Stage-2 STNO upper-bound (oracle-mask experiment) relies on a
-    # separate Stage-2 evaluation script that is not part of this release, so
-    # it is intentionally omitted here.
 }
 
 # ── Section 6: Summary ────────────────────────────────────────────────────────

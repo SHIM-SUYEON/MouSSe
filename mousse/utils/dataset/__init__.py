@@ -1,11 +1,11 @@
 from typing import Callable, Optional
 from pathlib import Path
-from .librittskor import LibriTTSKORDataset, _LOCAL_SCP_BASE
+from .mussed import MussedDataset, _LOCAL_SCP_BASE
 
 SETTINGS = {
-    "librittskor2": (LibriTTSKORDataset, {"n_src": 2, "mode": "min"}),
-    "librittskor3": (LibriTTSKORDataset, {"n_src": 3, "mode": "min"}),
-    "librittskor4": (LibriTTSKORDataset, {"n_src": 4, "mode": "min"}),
+    "mussed2": (MussedDataset, {"n_src": 2, "mode": "min"}),
+    "mussed3": (MussedDataset, {"n_src": 3, "mode": "min"}),
+    "mussed4": (MussedDataset, {"n_src": 4, "mode": "min"}),
 }
 
 
