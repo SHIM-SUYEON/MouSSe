@@ -26,6 +26,10 @@ output/
 *.flac
 *.json
 
+# ...but keep the curated demo figures shown in the README
+!assets/
+!assets/**
+
 # Datasets
 datasets/
 external_datasets/
