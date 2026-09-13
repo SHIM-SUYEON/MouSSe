@@ -3,10 +3,7 @@ import torchaudio
 import torchaudio.transforms as T
 import torchaudio.functional as F
 
-#
 # Cached Hann Window
-#
-
 hann_window_cache = {}
 def hann_window(size, device):
     global hann_window_cache
@@ -18,10 +15,7 @@ def hann_window(size, device):
         hann_window_cache[key] = res
         return res
 
-#
 # Mel Log Bank
-#
-
 melscale_fbank_cache = {}
 def melscale_fbanks(n_mels, n_fft, f_min, f_max, sample_rate, mel_norm, mel_scale, device):
     global melscale_fbank_cache
@@ -41,10 +35,7 @@ def melscale_fbanks(n_mels, n_fft, f_min, f_max, sample_rate, mel_norm, mel_scal
         melscale_fbank_cache[key] = res
         return res
 
-#
 # Resampler
-#
-
 resampler_cache = {}
 def resampler(from_sample_rate, to_sample_rate, device=None):
     global resampler_cache
@@ -65,10 +56,7 @@ def resampler(from_sample_rate, to_sample_rate, device=None):
         resampler_cache[key] = res
         return res
 
-#
 # Spectogram caclulcation
-#
-
 def spectogram(audio, n_fft, n_mels, n_hop, n_window, mel_norm, mel_scale, sample_rate):
 
     # Hann Window
@@ -103,10 +91,7 @@ def spectogram(audio, n_fft, n_mels, n_hop, n_window, mel_norm, mel_scale, sampl
 
     return log_spec
 
-#
 # Load Mono Audio
-#
-
 def load_mono_audio(src, sample_rate, device=None):
 
     # Load audio

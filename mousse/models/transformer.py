@@ -179,10 +179,8 @@ class AttentionBlock(torch.nn.Module):
 
         return y
 
-#
-# Convolutional positional embedding
-#
 
+# Convolutional positional embedding
 class ConvPositionEmbed(nn.Module):
     def __init__(self, n_dim, kernel_size):
         super().__init__()
@@ -203,10 +201,8 @@ class ConvPositionEmbed(nn.Module):
 
         return out
 
-#
-# ALiBi implementation
-#
 
+# ALiBi implementation
 slopes_cache = {}
 def get_slopes_power_of_2(n_heads, device):
     global slopes_cache

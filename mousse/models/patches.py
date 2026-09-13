@@ -19,9 +19,7 @@ from torch.utils.checkpoint import checkpoint as grad_checkpoint
 from mousse.configs import config
 
 
-# -----------------------------------------------------------------
 # Forward-pass monkey-patches
-# -----------------------------------------------------------------
 def safe_sinu_forward(self, x):
     x = x.reshape(-1)
     x = rearrange(x, "b -> b 1")
@@ -50,14 +48,14 @@ def generic_safe_forward(self, *, audio, noise, condition=None, times, mask=None
             output = output + condition
 
         orig_shape = list(output.shape)
-        seq_len  = orig_shape[-2]
+        seq_len = orig_shape[-2]
         feat_dim = orig_shape[-1]
-        leading  = orig_shape[:-2]
+        leading = orig_shape[:-2]
 
-        raw_sinu   = self.sinu_pos_emb(times)
+        raw_sinu = self.sinu_pos_emb(times)
         sinu_times = raw_sinu.view(leading + [1, feat_dim])
 
-        output      = torch.cat([output, sinu_times], dim=-2)
+        output = torch.cat([output, sinu_times], dim=-2)
         output_flat = output.view(-1, seq_len + 1, feat_dim)
         output_flat = self.conv_embed(output_flat) + output_flat
 

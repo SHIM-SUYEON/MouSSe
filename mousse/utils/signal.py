@@ -2,7 +2,6 @@
 
 import torch
 
-
 def rms_normalize(wav: torch.Tensor, target_rms: float = 0.1) -> torch.Tensor:
     rms = wav.pow(2).mean().sqrt()
     if rms < 1e-8:

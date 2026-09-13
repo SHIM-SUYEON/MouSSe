@@ -7,7 +7,6 @@ numpy==2.4.6
 scipy==1.17.1
 einops==0.8.2
 accelerate==1.13.0
-optuna==4.9.0
 wandb==0.27.0
 tqdm==4.67.3
 

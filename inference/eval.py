@@ -51,7 +51,7 @@ from mousse.utils.reporting import (
 random.seed(42)
 
 DEFAULT_CKPT = Path(
-    "./mousse/mousse.best.pt"
+    "./mousse/mousse-checkpoint.pt"
 )
 
 N_SRC_LIST = [2, 3, 4]
@@ -74,11 +74,8 @@ os.makedirs(DEFAULT_OUT_DIR, exist_ok=True)
 
 def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                       lambda_max=2.0, use_uq_guidance=True, condition=None,
-                      lambda_fixed=None, lambda_scale=None):
+                      lambda_scale=None):
     """ODE Euler sampler.
-    lambda_fixed: if set (float), overrides both use_uq_guidance and alpha.
-                  lambda_fixed=0.0 → conditioned only (no CFG, skips uncond pass).
-                  lambda_fixed>0.0 → fixed CFG scale.
     lambda_scale: if set (float), enables the diet/UQ-only formula:
                   lambda* = clamp(sigma_cond.mean * lambda_scale, max=lambda_max)
                   (UQ-only; no sigma_uncond term).
@@ -96,22 +93,15 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                 t_batch = torch.full((batch_size,), i * dt, device=device, dtype=audio.dtype)
                 v_cond = predictor(audio=audio, noise=z, times=t_batch, condition=condition)
 
-                if lambda_fixed is not None:
-                    # Fixed-lambda sweep: UQ head skipped entirely
-                    if lambda_fixed == 0.0:
-                        v_guided = v_cond  # no CFG, skip uncond pass
-                    else:
-                        v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
-                        v_guided = v_cond + (v_cond - v_uncond) * lambda_fixed
-                elif use_uq_guidance and lambda_scale is not None:
+                if use_uq_guidance and lambda_scale is not None:
                     v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
-                    log_s_cond   = uq_head(audio=audio,       noise=z, times=t_batch)
+                    log_s_cond = uq_head(audio=audio, noise=z, times=t_batch)
                     log_s_uncond = uq_head(audio=audio_empty, noise=z, times=t_batch)
-                    sigma_cond   = torch.exp(log_s_cond)
+                    sigma_cond = torch.exp(log_s_cond)
                     sigma_uncond = torch.exp(log_s_uncond)
                     sc = sigma_cond.float()
                     su = sigma_uncond.float()
-                    sigma_cond_sum   = sc if sigma_cond_sum   is None else sigma_cond_sum   + sc
+                    sigma_cond_sum = sc if sigma_cond_sum is None else sigma_cond_sum + sc
                     sigma_uncond_sum = su if sigma_uncond_sum is None else sigma_uncond_sum + su
                     lambda_star = torch.clamp(
                         sigma_cond.mean(dim=-1, keepdim=True) * lambda_scale,
@@ -139,7 +129,7 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                     v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
                     v_guided = v_cond + (v_cond - v_uncond) * alpha
                 z = z + v_guided.float() * dt
-    sigma_cond_mean   = sigma_cond_sum   / steps if sigma_cond_sum   is not None else None
+    sigma_cond_mean = sigma_cond_sum / steps if sigma_cond_sum is not None else None
     sigma_uncond_mean = sigma_uncond_sum / steps if sigma_uncond_sum is not None else None
     return z, sigma_cond_mean, sigma_uncond_mean
 
@@ -148,25 +138,23 @@ _VOCODER_CACHE = None
 
 def _snr_val(preds: torch.Tensor, target: torch.Tensor) -> float:
     signal = float(target.pow(2).mean())
-    noise  = float((preds - target).pow(2).mean())
+    noise = float((preds - target).pow(2).mean())
     if noise < 1e-8:
         return 40.0
     return 10.0 * math.log10(max(signal, 1e-8) / noise)
 
 def _eval_loop(backbone, uq_head, test_loaders, device,
-               stage=1, out_dir=None, save_wav=False, ablation='full', eval_steps=None,
-               lambda_fixed=None, lambda_scale=None):
+               out_dir=None, save_wav=False, ablation='full', eval_steps=None,
+               lambda_scale=None):
     """Run the evaluation loop and return raw accumulators (no printing of final tables)."""
 
     _ABLATION_VALID = ("full", "no_uq", "no_entropy")
     if ablation not in _ABLATION_VALID:
         raise ValueError(f"Unknown ablation mode '{ablation}'. Choose from {_ABLATION_VALID}")
-    use_uq_guidance = (stage == 2) and (ablation != "no_uq")
+    use_uq_guidance = (ablation != "no_uq")
     print(f"\n{'='*70}")
     print(f"  ABLATION MODE : {ablation.upper()}")
-    if lambda_fixed is not None:
-        print(f"  UQ guidance   : NO  — fixed λ={lambda_fixed:.2f} (lambda sweep override)")
-    elif use_uq_guidance and lambda_scale is not None:
+    if use_uq_guidance and lambda_scale is not None:
         print(f"  UQ guidance   : YES — λ*=σ_cond×{lambda_scale} (diet/UQ-only formula, max={2.0})")
     else:
         print(f"  UQ guidance   : {'YES — λ* adaptive (num/den)' if use_uq_guidance else 'NO  — fixed α=1.5'}")
@@ -177,12 +165,10 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
     uq_head.eval()
 
     sr = config.audio.sample_rate
-    stoi_m  = ShortTimeObjectiveIntelligibility(fs=sr, extended=False).to(device)
     estoi_m = ShortTimeObjectiveIntelligibility(fs=sr, extended=True).to(device)
-    pesq_m  = PerceptualEvaluationSpeechQuality(fs=PESQ_SR, mode="wb").to(device)
     sisnr_m = ScaleInvariantSignalNoiseRatio().to(device)
     sisdr_m = ScaleInvariantSignalDistortionRatio().to(device)
-    sdr_m   = SignalDistortionRatio(filter_length=1, zero_mean=False).to(device)
+    sdr_m = SignalDistortionRatio(filter_length=1, zero_mean=False).to(device)
 
     vocoder = get_vocoder(device)
     if out_dir is not None:
@@ -202,7 +188,6 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
 
     for n_src, loader in test_loaders.items():
         print(f"\n[EVAL] n_src={n_src}, {len(loader.dataset)} samples  (MAX_MIX_DURATION={MAX_MIX_DURATION}s)")
-        pesq_skip_cnt = 0
         dur_skip_cnt  = 0
 
         wav_dir = None
@@ -232,7 +217,6 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                 backbone, uq_head, mix_input,
                 steps=(eval_steps or EVAL_STEPS), alpha=1.5, lambda_max=2.0,
                 use_uq_guidance=use_uq_guidance,
-                lambda_fixed=lambda_fixed,
                 lambda_scale=lambda_scale,
             )
 
@@ -279,7 +263,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
 
             # Increment sample counters
             nsrc_acc[n_src]["n_samples"] += 1
-            if lang and lang in LANG_CATS:     cat_acc[n_src]["lang"][lang]["n_samples"]       += 1
+            if lang and lang in LANG_CATS: cat_acc[n_src]["lang"][lang]["n_samples"]       += 1
             if gender and gender in GENDER_CATS: cat_acc[n_src]["gender"][gender]["n_samples"] += 1
             if overlap and overlap in OVERLAP_CATS: cat_acc[n_src]["overlap"][overlap]["n_samples"] += 1
 
@@ -296,96 +280,15 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                 t_vec   = tgt_slots[ti]
                 spk_key = f"s{ti + 1}"
                 uq_val = None
-                uq_active_val = None
                 if sigma_cond_mean is not None:
                     slot_sigma = sigma_cond_mean[0, pi * T_per_spk:(pi + 1) * T_per_spk, :]
-                    # --- All-frames UQ (existing) ---
                     uq_val = round(float(slot_sigma.mean().item()), 6)
                     _acc_add(nsrc_acc[n_src], uq=uq_val)
-                    if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       uq=uq_val)
-                    if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   uq=uq_val)
+                    if lang    and lang    in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], uq=uq_val)
+                    if gender  and gender  in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], uq=uq_val)
                     if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], uq=uq_val)
-                    # --- Active-frames-only UQ ---
-                    # Active mask: frames where target mel energy exceeds ACTIVE_THRESH
-                    tgt_mel = tgt_slots[ti].view(T_per_spk, -1)       # [T, n_mels]
-                    active_mask = tgt_mel.abs().sum(dim=-1) > ACTIVE_THRESH  # [T]
-                    n_active = active_mask.sum().item()
-                    if n_active > 0:
-                        uq_active_val = round(float(slot_sigma[active_mask].mean().item()), 6)
-                        _acc_add(nsrc_acc[n_src], uq_active=uq_active_val)
-                        if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       uq_active=uq_active_val)
-                        if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   uq_active=uq_active_val)
-                        if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], uq_active=uq_active_val)
-                    # --- STO region sigma (Silence / Target-only / Overlap) ---
-                    other_mels = [tgt_slots[oi].view(T_per_spk, -1) for oi in range(n_src) if oi != ti]
-                    if other_mels:
-                        others_active = torch.stack(
-                            [m.abs().sum(dim=-1) > ACTIVE_THRESH for m in other_mels]
-                        ).any(dim=0)
-                    else:
-                        others_active = torch.zeros(T_per_spk, dtype=torch.bool, device=slot_sigma.device)
-                    silence_mask     = ~active_mask
-                    target_only_mask = active_mask & ~others_active
-                    overlap_mask     = active_mask &  others_active
-                    slot_su = (sigma_uncond_mean[0, pi*T_per_spk:(pi+1)*T_per_spk, :]
-                               if sigma_uncond_mean is not None else None)
-                    if silence_mask.any():
-                        sc = float(slot_sigma[silence_mask].mean().item())
-                        _acc_add(nsrc_acc[n_src], uq_silence=sc)
-                        if slot_su is not None:
-                            _acc_add(nsrc_acc[n_src], uq_uncond_silence=float(slot_su[silence_mask].mean().item()))
-                    if target_only_mask.any():
-                        sc = float(slot_sigma[target_only_mask].mean().item())
-                        _acc_add(nsrc_acc[n_src], uq_target=sc)
-                        if slot_su is not None:
-                            _acc_add(nsrc_acc[n_src], uq_uncond_target=float(slot_su[target_only_mask].mean().item()))
-                    if overlap_mask.any():
-                        sc = float(slot_sigma[overlap_mask].mean().item())
-                        _acc_add(nsrc_acc[n_src], uq_overlap=sc)
-                        if slot_su is not None:
-                            _acc_add(nsrc_acc[n_src], uq_uncond_overlap=float(slot_su[overlap_mask].mean().item()))
-                spk_rec = {"si_snr_mix": None, "si_snri": None, "si_snr_out": None,
-                           "sisdri_vo": None, "si_sdr_out_vo": None, "si_sdr_mix_vo": None,
-                           "sdri_vo": None,
-                           "sisdri_orig": None, "sdri_orig": None,
-                           "estoi": None, "estoii": None,
-                           "stoi": None, "stoii": None, "pesq": None, "dur": None,
-                           "stoi_orig": None, "stoii_orig": None,
-                           "estoi_orig": None, "estoii_orig": None, "pesq_orig": None,
-                           "uq_sigma_mean": uq_val, "uq_sigma_active": uq_active_val}
+                spk_rec = {"sisdri": None, "sdri": None, "estoi": None, "estoii": None, "uq_sigma_mean": uq_val}
 
-                # Speech duration from JSON metadata (target speaker ti)
-                if meta is not None and ti < len(meta["durations"]):
-                    dur_val = meta["durations"][ti]
-                    spk_rec["dur"] = round(dur_val, 4)
-                    _acc_add(nsrc_acc[n_src], dur=dur_val)
-                    if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       dur=dur_val)
-                    if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   dur=dur_val)
-                    if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], dur=dur_val)
-
-                # SI-SNRi (mel-domain) + absolute SI-SNR_out and SI-SNR_mix
-                try:
-                    sisnr_sep     = float(-cost_mat[pi, ti])   # SI-SNR(output, target)
-                    sisnr_mix_val = sisnr_m(mix_slot, t_vec).item()  # SI-SNR(mixture, target)
-                    sisnri_val    = sisnr_sep - sisnr_mix_val
-                    spk_rec["si_snr_mix"] = round(sisnr_mix_val, 4)
-                    spk_rec["si_snri"]    = round(sisnri_val, 4)
-                    spk_rec["si_snr_out"] = round(sisnr_sep, 4)
-                    _acc_add(nsrc_acc[n_src], sisnri=sisnri_val,
-                             si_snr_out=sisnr_sep, si_snr_mix=sisnr_mix_val)
-                    if lang and lang in LANG_CATS:
-                        _acc_add(cat_acc[n_src]["lang"][lang],
-                                 sisnri=sisnri_val, si_snr_out=sisnr_sep, si_snr_mix=sisnr_mix_val)
-                    if gender and gender in GENDER_CATS:
-                        _acc_add(cat_acc[n_src]["gender"][gender],
-                                 sisnri=sisnri_val, si_snr_out=sisnr_sep, si_snr_mix=sisnr_mix_val)
-                    if overlap and overlap in OVERLAP_CATS:
-                        _acc_add(cat_acc[n_src]["overlap"][overlap],
-                                 sisnri=sisnri_val, si_snr_out=sisnr_sep, si_snr_mix=sisnr_mix_val)
-                except Exception as e:
-                    print(f"  [SI-SNRi] error spk={pi}: {e}")
-
-                # Vocoder → wav save + SI-SDRi + SDRi (waveform) + STOI + PESQ
                 if vocoder is not None:
                     src_mel_frames = T_per_spk
                     if ti < len(item_src_paths):
@@ -408,17 +311,6 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                         record[spk_key] = spk_rec
                         continue
 
-                    # Load original source waveform for _orig metrics
-                    wav_orig = None
-                    if ti < len(item_src_paths):
-                        try:
-                            wav_orig_raw, orig_sr = torchaudio.load(item_src_paths[ti])
-                            if orig_sr != sr:
-                                wav_orig_raw = torchaudio.functional.resample(wav_orig_raw, orig_sr, sr)
-                            wav_orig = wav_orig_raw.mean(0).to(device)
-                        except Exception as e:
-                            print(f"  [WAV] orig load error spk={ti}: {e}")
-
                     # Save separated wav
                     if sample_dir is not None:
                         try:
@@ -435,7 +327,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                         wav_t_n.pow(2).mean().sqrt().item() >= _MIN_RMS
                     )
 
-                    # SI-SDRi, SI-SDR_out, SI-SDR_mix, SDRi vs vocoded target (waveform domain)
+                    # SI-SDRi + SDRi (improvement over mixture baseline)
                     if has_speech and wav_mix is not None:
                         try:
                             tgt_len = wav_t_n.shape[-1]
@@ -447,235 +339,54 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
 
                             sisdr_sep = sisdr_m(wav_p_n[:min_len], wav_t_n[:min_len]).item()
                             sisdr_mix = sisdr_m(wav_mix_n[:min_len], wav_t_n[:min_len]).item()
-                            sisdri_vo_val = sisdr_sep - sisdr_mix
+                            sisdri_val = sisdr_sep - sisdr_mix
+                            if not (math.isnan(sisdri_val) or math.isinf(sisdri_val)):
+                                spk_rec["sisdri"] = round(sisdri_val, 4)
+                                _acc_add(nsrc_acc[n_src], sisdri=sisdri_val)
+                                if lang and lang in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], sisdri=sisdri_val)
+                                if gender and gender in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], sisdri=sisdri_val)
+                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], sisdri=sisdri_val)
 
-                            # SI-SDRi (improvement)
-                            if not (math.isnan(sisdri_vo_val) or math.isinf(sisdri_vo_val)):
-                                spk_rec["sisdri_vo"] = round(sisdri_vo_val, 4)
-                                _acc_add(nsrc_acc[n_src], sisdri_vo=sisdri_vo_val)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       sisdri_vo=sisdri_vo_val)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   sisdri_vo=sisdri_vo_val)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], sisdri_vo=sisdri_vo_val)
-
-                            # SI-SDR_out absolute (baseline-free, for fair n_src comparison)
-                            if not (math.isnan(sisdr_sep) or math.isinf(sisdr_sep)):
-                                spk_rec["si_sdr_out_vo"] = round(sisdr_sep, 4)
-                                _acc_add(nsrc_acc[n_src], si_sdr_out_vo=sisdr_sep)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       si_sdr_out_vo=sisdr_sep)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   si_sdr_out_vo=sisdr_sep)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], si_sdr_out_vo=sisdr_sep)
-
-                            # SI-SDR_mix baseline (reveals per-n_src inflation)
-                            if not (math.isnan(sisdr_mix) or math.isinf(sisdr_mix)):
-                                spk_rec["si_sdr_mix_vo"] = round(sisdr_mix, 4)
-                                _acc_add(nsrc_acc[n_src], si_sdr_mix_vo=sisdr_mix)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       si_sdr_mix_vo=sisdr_mix)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   si_sdr_mix_vo=sisdr_mix)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], si_sdr_mix_vo=sisdr_mix)
-
-                            sdr_sep_vo = sdr_m(wav_p_n[:min_len], wav_t_n[:min_len]).item()
-                            sdr_mix_vo = sdr_m(wav_mix_n[:min_len], wav_t_n[:min_len]).item()
-                            sdri_vo_val = sdr_sep_vo - sdr_mix_vo
-                            if not (math.isnan(sdri_vo_val) or math.isinf(sdri_vo_val)):
-                                spk_rec["sdri_vo"] = round(sdri_vo_val, 4)
-                                _acc_add(nsrc_acc[n_src], sdri_vo=sdri_vo_val)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       sdri_vo=sdri_vo_val)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   sdri_vo=sdri_vo_val)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], sdri_vo=sdri_vo_val)
-
-                            snr_sep_vo = _snr_val(wav_p_n[:min_len], wav_t_n[:min_len])
-                            snr_mix_vo = _snr_val(wav_mix_n[:min_len], wav_t_n[:min_len])
-                            snri_vo_val = snr_sep_vo - snr_mix_vo
-                            if not (math.isnan(snri_vo_val) or math.isinf(snri_vo_val)):
-                                spk_rec["snri_vo"] = round(snri_vo_val, 4)
-                                _acc_add(nsrc_acc[n_src], snri_vo=snri_vo_val)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       snri_vo=snri_vo_val)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   snri_vo=snri_vo_val)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], snri_vo=snri_vo_val)
+                            sdr_sep = sdr_m(wav_p_n[:min_len], wav_t_n[:min_len]).item()
+                            sdr_mix = sdr_m(wav_mix_n[:min_len], wav_t_n[:min_len]).item()
+                            sdri_val = sdr_sep - sdr_mix
+                            if not (math.isnan(sdri_val) or math.isinf(sdri_val)):
+                                spk_rec["sdri"] = round(sdri_val, 4)
+                                _acc_add(nsrc_acc[n_src], sdri=sdri_val)
+                                if lang and lang in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], sdri=sdri_val)
+                                if gender and gender in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], sdri=sdri_val)
+                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], sdri=sdri_val)
                         except Exception as e:
-                            print(f"  [SI-SDRi/SDRi vo] error spk={pi}: {e}")
+                            print(f"  [SI-SDRi/SDRi] error spk={pi}: {e}")
 
-                    # SI-SDRi and SDRi vs original target (waveform domain)
-                    if has_speech and wav_mix is not None and wav_orig is not None:
-                        try:
-                            wav_orig_n = rms_normalize(wav_orig)
-                            if wav_orig_n.pow(2).mean().sqrt().item() >= _MIN_RMS:
-                                orig_len = wav_orig_n.shape[-1]
-                                wav_mix_trim_o = wav_mix[:orig_len]
-                                if wav_mix_trim_o.shape[-1] < orig_len:
-                                    wav_mix_trim_o = F.pad(wav_mix_trim_o, (0, orig_len - wav_mix_trim_o.shape[-1]))
-                                wav_mix_n_o = rms_normalize(wav_mix_trim_o)
-                                min_len_o = min(wav_p_n.shape[-1], orig_len)
-
-                                sisdr_sep_o = sisdr_m(wav_p_n[:min_len_o], wav_orig_n[:min_len_o]).item()
-                                sisdr_mix_o = sisdr_m(wav_mix_n_o[:min_len_o], wav_orig_n[:min_len_o]).item()
-                                sisdri_orig_val = sisdr_sep_o - sisdr_mix_o
-                                if not (math.isnan(sisdri_orig_val) or math.isinf(sisdri_orig_val)):
-                                    spk_rec["sisdri_orig"] = round(sisdri_orig_val, 4)
-                                    _acc_add(nsrc_acc[n_src], sisdri_orig=sisdri_orig_val)
-                                    if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       sisdri_orig=sisdri_orig_val)
-                                    if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   sisdri_orig=sisdri_orig_val)
-                                    if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], sisdri_orig=sisdri_orig_val)
-
-                                sdr_sep_o = sdr_m(wav_p_n[:min_len_o], wav_orig_n[:min_len_o]).item()
-                                sdr_mix_o = sdr_m(wav_mix_n_o[:min_len_o], wav_orig_n[:min_len_o]).item()
-                                sdri_orig_val = sdr_sep_o - sdr_mix_o
-                                if not (math.isnan(sdri_orig_val) or math.isinf(sdri_orig_val)):
-                                    spk_rec["sdri_orig"] = round(sdri_orig_val, 4)
-                                    _acc_add(nsrc_acc[n_src], sdri_orig=sdri_orig_val)
-                                    if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       sdri_orig=sdri_orig_val)
-                                    if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   sdri_orig=sdri_orig_val)
-                                    if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], sdri_orig=sdri_orig_val)
-                        except Exception as e:
-                            print(f"  [SI-SDRi/SDRi orig] error spk={pi}: {e}")
-
+                    # ESTOI (absolute) + ESTOIi (improvement over mixture baseline)
                     if has_speech and wav_p_n.shape[-1] >= int(sr * 0.5):
                         try:
-                            stoi_val = stoi_m(wav_p_n, wav_t_n).item()
-                            spk_rec["stoi"] = round(stoi_val, 4)
-                            _acc_add(nsrc_acc[n_src], stoi=stoi_val)
-                            if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       stoi=stoi_val)
-                            if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   stoi=stoi_val)
-                            if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], stoi=stoi_val)
-                            # ESTOi (Extended STOI, absolute)
                             estoi_val = estoi_m(wav_p_n, wav_t_n).item()
                             if not (math.isnan(estoi_val) or math.isinf(estoi_val)):
                                 spk_rec["estoi"] = round(estoi_val, 4)
                                 _acc_add(nsrc_acc[n_src], estoi=estoi_val)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       estoi=estoi_val)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   estoi=estoi_val)
+                                if lang and lang in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], estoi=estoi_val)
+                                if gender and gender in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], estoi=estoi_val)
                                 if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoi=estoi_val)
 
-                            # STOIi / ESTOii: improvement over mixture-signal baseline
-                            # Trim mixture to match the vocoded target length for a fair comparison
-                            if wav_mix is not None:
-                                tgt_w_len = wav_t_n.shape[-1]
-                                mix_for_stoi = wav_mix[:tgt_w_len]
-                                if mix_for_stoi.shape[-1] < tgt_w_len:
-                                    mix_for_stoi = F.pad(mix_for_stoi, (0, tgt_w_len - mix_for_stoi.shape[-1]))
-                                mix_stoi_n = rms_normalize(mix_for_stoi)
-                                if mix_stoi_n.shape[-1] >= int(sr * 0.5):
-                                    stoi_mix_val = stoi_m(mix_stoi_n, wav_t_n).item()
-                                    stoii_val = stoi_val - stoi_mix_val
-                                    if not (math.isnan(stoii_val) or math.isinf(stoii_val)):
-                                        spk_rec["stoii"] = round(stoii_val, 4)
-                                        _acc_add(nsrc_acc[n_src], stoii=stoii_val)
-                                        if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       stoii=stoii_val)
-                                        if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   stoii=stoii_val)
-                                        if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], stoii=stoii_val)
-
-                                    estoi_mix_val = estoi_m(mix_stoi_n, wav_t_n).item()
-                                    estoii_val = estoi_val - estoi_mix_val
-                                    if not (math.isnan(estoii_val) or math.isinf(estoii_val)):
-                                        spk_rec["estoii"] = round(estoii_val, 4)
-                                        _acc_add(nsrc_acc[n_src], estoii=estoii_val)
-                                        if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       estoii=estoii_val)
-                                        if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   estoii=estoii_val)
-                                        if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoii=estoii_val)
-                        except Exception as e:
-                            print(f"  [STOI/ESTOi] error spk={pi}: {e}")
-
-                    if has_speech:
-                        try:
-                            p_16k = torchaudio.functional.resample(wav_p_n.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                            t_16k = torchaudio.functional.resample(wav_t_n.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                            p_16k = p_16k.clamp(-1.0, 1.0)
-                            t_16k = t_16k.clamp(-1.0, 1.0)
-                            if p_16k.shape[-1] >= int(PESQ_SR * 0.5) and t_16k.shape[-1] >= int(PESQ_SR * 0.5):
-                                pesq_val = pesq_m(p_16k, t_16k).item()
-                                spk_rec["pesq"] = round(pesq_val, 4)
-                                _acc_add(nsrc_acc[n_src], pesq=pesq_val)
-                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       pesq=pesq_val)
-                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   pesq=pesq_val)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], pesq=pesq_val)
-
-                                # PESQi: improvement over mixture baseline
                                 if wav_mix is not None:
                                     tgt_w_len = wav_t_n.shape[-1]
-                                    mix_for_pesq = wav_mix[:tgt_w_len]
-                                    if mix_for_pesq.shape[-1] < tgt_w_len:
-                                        mix_for_pesq = F.pad(mix_for_pesq, (0, tgt_w_len - mix_for_pesq.shape[-1]))
-                                    mix_pesq_n = rms_normalize(mix_for_pesq)
-                                    mx_16k = torchaudio.functional.resample(mix_pesq_n.unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                                    mx_16k = mx_16k.clamp(-1.0, 1.0)
-                                    if mx_16k.shape[-1] >= int(PESQ_SR * 0.5):
-                                        pesq_mix_val = pesq_m(mx_16k, t_16k).item()
-                                        pesqi_val = pesq_val - pesq_mix_val
-                                        if not (math.isnan(pesqi_val) or math.isinf(pesqi_val)):
-                                            spk_rec["pesqi"] = round(pesqi_val, 4)
-                                            _acc_add(nsrc_acc[n_src], pesqi=pesqi_val)
-                                            if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       pesqi=pesqi_val)
-                                            if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   pesqi=pesqi_val)
-                                            if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], pesqi=pesqi_val)
+                                    mix_for_stoi = wav_mix[:tgt_w_len]
+                                    if mix_for_stoi.shape[-1] < tgt_w_len:
+                                        mix_for_stoi = F.pad(mix_for_stoi, (0, tgt_w_len - mix_for_stoi.shape[-1]))
+                                    mix_stoi_n = rms_normalize(mix_for_stoi)
+                                    if mix_stoi_n.shape[-1] >= int(sr * 0.5):
+                                        estoi_mix_val = estoi_m(mix_stoi_n, wav_t_n).item()
+                                        estoii_val = estoi_val - estoi_mix_val
+                                        if not (math.isnan(estoii_val) or math.isinf(estoii_val)):
+                                            spk_rec["estoii"] = round(estoii_val, 4)
+                                            _acc_add(nsrc_acc[n_src], estoii=estoii_val)
+                                            if lang and lang in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], estoii=estoii_val)
+                                            if gender and gender in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], estoii=estoii_val)
+                                            if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoii=estoii_val)
                         except Exception as e:
-                            if "No utterances" in str(e):
-                                pesq_skip_cnt += 1
-                            else:
-                                print(f"  [PESQ] error spk={pi}: {e}")
-
-                    # STOI / ESTOI / PESQ vs original wav (paper-standard: no vocoder in reference chain)
-                    if has_speech and wav_orig is not None:
-                        try:
-                            wav_orig_n2 = rms_normalize(wav_orig)
-                            if (wav_orig_n2.pow(2).mean().sqrt().item() >= _MIN_RMS
-                                    and wav_p_n.shape[-1] >= int(sr * 0.5)):
-                                orig_len2 = wav_orig_n2.shape[-1]
-                                min_len_o2 = min(wav_p_n.shape[-1], orig_len2)
-                                if min_len_o2 >= int(sr * 0.5):
-                                    stoi_orig_val  = stoi_m(wav_p_n[:min_len_o2], wav_orig_n2[:min_len_o2]).item()
-                                    estoi_orig_val = estoi_m(wav_p_n[:min_len_o2], wav_orig_n2[:min_len_o2]).item()
-                                    spk_rec["stoi_orig"] = round(stoi_orig_val, 4)
-                                    _acc_add(nsrc_acc[n_src], stoi_orig=stoi_orig_val)
-                                    if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       stoi_orig=stoi_orig_val)
-                                    if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   stoi_orig=stoi_orig_val)
-                                    if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], stoi_orig=stoi_orig_val)
-                                    if not (math.isnan(estoi_orig_val) or math.isinf(estoi_orig_val)):
-                                        spk_rec["estoi_orig"] = round(estoi_orig_val, 4)
-                                        _acc_add(nsrc_acc[n_src], estoi_orig=estoi_orig_val)
-                                        if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       estoi_orig=estoi_orig_val)
-                                        if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   estoi_orig=estoi_orig_val)
-                                        if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoi_orig=estoi_orig_val)
-                                    # Improvement over mixture baseline (vs original wav)
-                                    if wav_mix is not None:
-                                        mix_for_o = wav_mix[:min_len_o2]
-                                        if mix_for_o.shape[-1] < min_len_o2:
-                                            mix_for_o = F.pad(mix_for_o, (0, min_len_o2 - mix_for_o.shape[-1]))
-                                        mix_o_n = rms_normalize(mix_for_o)
-                                        if mix_o_n.shape[-1] >= int(sr * 0.5):
-                                            stoi_mix_o  = stoi_m(mix_o_n, wav_orig_n2[:min_len_o2]).item()
-                                            estoi_mix_o = estoi_m(mix_o_n, wav_orig_n2[:min_len_o2]).item()
-                                            stoii_orig_val  = stoi_orig_val  - stoi_mix_o
-                                            estoii_orig_val = estoi_orig_val - estoi_mix_o
-                                            if not (math.isnan(stoii_orig_val) or math.isinf(stoii_orig_val)):
-                                                spk_rec["stoii_orig"] = round(stoii_orig_val, 4)
-                                                _acc_add(nsrc_acc[n_src], stoii_orig=stoii_orig_val)
-                                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       stoii_orig=stoii_orig_val)
-                                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   stoii_orig=stoii_orig_val)
-                                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], stoii_orig=stoii_orig_val)
-                                            if not (math.isnan(estoii_orig_val) or math.isinf(estoii_orig_val)):
-                                                spk_rec["estoii_orig"] = round(estoii_orig_val, 4)
-                                                _acc_add(nsrc_acc[n_src], estoii_orig=estoii_orig_val)
-                                                if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       estoii_orig=estoii_orig_val)
-                                                if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   estoii_orig=estoii_orig_val)
-                                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoii_orig=estoii_orig_val)
-                                    # PESQ vs original
-                                    try:
-                                        p_16k_o = torchaudio.functional.resample(wav_p_n[:min_len_o2].unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                                        o_16k   = torchaudio.functional.resample(wav_orig_n2[:min_len_o2].unsqueeze(0), sr, PESQ_SR).squeeze(0).to(device)
-                                        p_16k_o = p_16k_o.clamp(-1.0, 1.0)
-                                        o_16k   = o_16k.clamp(-1.0, 1.0)
-                                        if p_16k_o.shape[-1] >= int(PESQ_SR * 0.5) and o_16k.shape[-1] >= int(PESQ_SR * 0.5):
-                                            pesq_orig_val = pesq_m(p_16k_o, o_16k).item()
-                                            spk_rec["pesq_orig"] = round(pesq_orig_val, 4)
-                                            _acc_add(nsrc_acc[n_src], pesq_orig=pesq_orig_val)
-                                            if lang    and lang    in LANG_CATS:    _acc_add(cat_acc[n_src]["lang"][lang],       pesq_orig=pesq_orig_val)
-                                            if gender  and gender  in GENDER_CATS:  _acc_add(cat_acc[n_src]["gender"][gender],   pesq_orig=pesq_orig_val)
-                                            if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], pesq_orig=pesq_orig_val)
-                                    except Exception as e:
-                                        if "No utterances" not in str(e):
-                                            print(f"  [PESQ orig] error spk={pi}: {e}")
-                        except Exception as e:
-                            print(f"  [STOI/PESQ orig] error spk={pi}: {e}")
+                            print(f"  [ESTOI] error spk={pi}: {e}")
 
                 record[spk_key] = spk_rec
 
@@ -685,29 +396,22 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
         acc = nsrc_acc[n_src]
         print(
             f"[n_src={n_src}]  "
-            f"SDRi(vo)={_avg(acc,'sdri_vo'):.2f} dB (n={acc['n_sdri_vo']})  "
-            f"SI-SDRi(vo)={_avg(acc,'sisdri_vo'):.2f} dB (n={acc['n_sisdri_vo']})  "
-            f"STOIi={_avg(acc,'stoii'):.4f} (n={acc['n_stoii']})  "
+            f"SDRi={_avg(acc,'sdri'):.2f} dB (n={acc['n_sdri']})  "
+            f"SI-SDRi={_avg(acc,'sisdri'):.2f} dB (n={acc['n_sisdri']})  "
+            f"ESTOI={_avg(acc,'estoi'):.4f} (n={acc['n_estoi']})  "
             f"ESTOIi={_avg(acc,'estoii'):.4f} (n={acc['n_estoii']})  "
-            f"PESQi={_avg(acc,'pesqi'):.4f} (n={acc['n_pesqi']})  "
-            f"[dur_skipped(>{MAX_MIX_DURATION}s): {dur_skip_cnt}  PESQ skipped (no utterances): {pesq_skip_cnt}]"
+            f"UQ={_avg(acc,'uq'):.6f} (n={acc['n_uq']})  "
+            f"[dur_skipped(>{MAX_MIX_DURATION}s): {dur_skip_cnt}]"
         )
-        if acc["n_uq_silence"] > 0:
-            _fs = lambda k: f"{_avg(acc, k):.4f}" if acc[f'n_{k}'] > 0 else "N/A"
-            print(
-                f"  [STO-sigma n_src={n_src}]  "
-                f"S(cond)={_fs('uq_silence')}  T(cond)={_fs('uq_target')}  O(cond)={_fs('uq_overlap')}  ||  "
-                f"S(uncond)={_fs('uq_uncond_silence')}  T(uncond)={_fs('uq_uncond_target')}  O(uncond)={_fs('uq_uncond_overlap')}"
-            )
 
-    del stoi_m, estoi_m, pesq_m, sisnr_m, sisdr_m, sdr_m
+    del estoi_m, sisnr_m, sisdr_m, sdr_m
     gc.collect()
     torch.cuda.empty_cache()
 
     return nsrc_acc, cat_acc, per_sample_records
 
 
-# ─── Checkpoint loading ───────────────────────────────────────────────────────
+# Checkpoint loading 
 def load_checkpoint(ckpt_path, device):
     try:
         torch.serialization.add_safe_globals([np.core.multiarray.scalar])
@@ -739,14 +443,14 @@ def load_checkpoint(ckpt_path, device):
     return backbone, uq_head
 
 
-# ─── Result saving ────────────────────────────────────────────────────────────
+# Result saving 
 def _save_results(results, out_dir, ckpt_path, args):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     per_sample = results.pop("per_sample", [])
-    # Paper metrics only (improvement over mixture baseline, vs vocoded target).
-    KEEP_SPK = ("sdri_vo", "sisdri_vo", "stoii", "estoii", "pesqi")
+    # Metrics kept per speaker slot.
+    KEEP_SPK = ("sisdri", "sdri", "estoi", "estoii", "uq_sigma_mean")
     per_sample_trim = []
     for rec in per_sample:
         out = {k: rec.get(k) for k in ("stem", "n_src", "lang", "gender", "overlap")}
@@ -771,15 +475,11 @@ def _save_results(results, out_dir, ckpt_path, args):
                 "stem": rec["stem"], "n_src": rec["n_src"],
                 "lang": rec["lang"], "gender": rec["gender"], "overlap": rec["overlap"],
                 "speaker_slot": spk_key,
-                # Paper metrics (improvement over mixture baseline, vs vocoded target)
-                "sdri_vo":         sd.get("sdri_vo"),
-                "sisdri_vo":       sd.get("sisdri_vo"),
-                "stoii":           sd.get("stoii"),
-                "estoii":          sd.get("estoii"),
-                "pesqi":           sd.get("pesqi"),
-                # Model uncertainty
-                "uq_sigma_mean":   sd.get("uq_sigma_mean"),
-                "uq_sigma_active": sd.get("uq_sigma_active"),
+                "sisdri": sd.get("sisdri"),
+                "sdri": sd.get("sdri"),
+                "estoi": sd.get("estoi"),
+                "estoii": sd.get("estoii"),
+                "uq_sigma_mean": sd.get("uq_sigma_mean"),
             })
     uq_json_path = out_dir / "per-sample-uncertainty.json"
     with open(uq_json_path, "w") as f:
@@ -788,7 +488,6 @@ def _save_results(results, out_dir, ckpt_path, args):
 
     results_path = out_dir / "test_metrics_analyze.json"
     results["checkpoint"] = str(ckpt_path)
-    results["stage"] = args.stage
     results["ablation"] = args.ablation
     results["cap"] = args.cap
     with open(results_path, "w") as f:
@@ -796,7 +495,6 @@ def _save_results(results, out_dir, ckpt_path, args):
     print(f"[EVAL] Aggregate results saved to {results_path}")
 
 
-# ─── Multi-GPU helpers ────────────────────────────────────────────────────────
 def _build_test_loaders(args, shard_rank=0, shard_world=1):
     """Build per-n_src DataLoaders, sharded for multi-GPU workers."""
     test_loaders = {}
@@ -829,18 +527,16 @@ def _multi_gpu_eval(ckpt_path, args, gpu_list, out_dir):
             temp_files.append(tmp_pkl)
             cmd = [
                 sys.executable, __file__,
-                "--ckpt",        str(ckpt_path),
-                "--gpu",         str(gid),
-                "--stage",       str(args.stage),
-                "--ablation",    args.ablation,
-                "--cap",         str(args.cap),
-                "--out",         str(out_dir),
+                "--ckpt", str(ckpt_path),
+                "--gpu", str(gid),
+                "--ablation", args.ablation,
+                "--cap", str(args.cap),
+                "--out", str(out_dir),
                 f"--shard-rank={rank}",
                 f"--shard-world={len(gpu_list)}",
                 f"--temp-out={tmp_pkl}",
             ] + (["--save-wav"] if args.save_wav else []) \
               + (["--steps", str(args.steps)] if getattr(args, 'steps', None) else []) \
-              + (["--lambda-fixed", str(args.lambda_fixed)] if getattr(args, 'lambda_fixed', None) is not None else []) \
               + (["--lambda-scale", str(args.lambda_scale)] if getattr(args, 'lambda_scale', None) is not None else [])
             print(f"[EVAL] Spawning worker rank={rank} on GPU {gid}")
             procs.append(subprocess.Popen(cmd))
@@ -854,8 +550,8 @@ def _multi_gpu_eval(ckpt_path, args, gpu_list, out_dir):
         merged_nsrc = {n: _make_acc() for n in N_SRC_LIST}
         merged_cat = {
             n: {
-                "lang":    {c: _make_acc() for c in LANG_CATS},
-                "gender":  {c: _make_acc() for c in GENDER_CATS},
+                "lang": {c: _make_acc() for c in LANG_CATS},
+                "gender": {c: _make_acc() for c in GENDER_CATS},
                 "overlap": {c: _make_acc() for c in OVERLAP_CATS},
             }
             for n in N_SRC_LIST
@@ -866,8 +562,8 @@ def _multi_gpu_eval(ckpt_path, args, gpu_list, out_dir):
                 nsrc_acc, cat_acc, per_sample = pickle.load(f)
             for n in N_SRC_LIST:
                 _merge_acc(merged_nsrc[n], nsrc_acc[n])
-                for c in LANG_CATS:    _merge_acc(merged_cat[n]["lang"][c],    cat_acc[n]["lang"][c])
-                for c in GENDER_CATS:  _merge_acc(merged_cat[n]["gender"][c],  cat_acc[n]["gender"][c])
+                for c in LANG_CATS: _merge_acc(merged_cat[n]["lang"][c], cat_acc[n]["lang"][c])
+                for c in GENDER_CATS: _merge_acc(merged_cat[n]["gender"][c], cat_acc[n]["gender"][c])
                 for c in OVERLAP_CATS: _merge_acc(merged_cat[n]["overlap"][c], cat_acc[n]["overlap"][c])
             merged_per_sample.extend(per_sample)
     finally:
@@ -884,7 +580,7 @@ def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world
     print(f"[EVAL] Device: {device}  GPU={gpu_id}")
 
     apply_forward_patches()
-    print(f"[EVAL] Loading {ckpt_path} for stage {args.stage}  ablation={args.ablation}")
+    print(f"[EVAL] Loading {ckpt_path}  ablation={args.ablation}")
     backbone, uq_head = load_checkpoint(ckpt_path, device)
 
     print(f"\n[EVAL] Building test loaders (cap={args.cap} per n_src)...")
@@ -896,9 +592,8 @@ def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world
 
     return _eval_loop(
         backbone, uq_head, test_loaders, device,
-        stage=args.stage, out_dir=str(out_dir), save_wav=args.save_wav,
+        out_dir=str(out_dir), save_wav=args.save_wav,
         ablation=args.ablation, eval_steps=getattr(args, 'steps', None),
-        lambda_fixed=getattr(args, 'lambda_fixed', None),
         lambda_scale=getattr(args, 'lambda_scale', None),
     )
 
@@ -928,49 +623,40 @@ def _eval_one_ckpt(ckpt_path, args, gpu_list, out_dir):
             results = _finalize_results(nsrc_acc, cat_acc, per_sample, N_SRC_LIST)
             _save_results(results, out_dir, ckpt_path, args)
 
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
+# Entry point 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate stage-1 separation model on MUSSED test set."
+        description="Evaluate the MUSSE separation model on the MUSSED test set."
     )
     parser.add_argument("--ckpt", default=str(DEFAULT_CKPT),
                         help="Path to .pt checkpoint, OR a directory to evaluate all .pt files inside")
     parser.add_argument("--gpu", default="4",
                         help="Single GPU id ('4') or comma-separated list for multi-GPU ('0,1,2,3')")
-    parser.add_argument("--stage",   default=2, type=int, choices=[1, 2])
     parser.add_argument("--ablation", default="full",
                         choices=["full", "no_uq", "no_entropy"],
                         help=(
-                            "Ablation mode for stage-2 evaluation:\n"
+                            "Ablation mode:\n"
                             "  full          — UQ guidance (λ* adaptive)          [full model]\n"
                             "  no_uq         — no UQ guidance (fixed α=1.5)        [same ckpt]\n"
                             "  no_entropy    — UQ guidance, separate no-entropy    [no-entropy ckpt]\n"
                         ))
-    parser.add_argument("--cap",     default=TEST_CAP, type=int,
+    parser.add_argument("--cap", default=TEST_CAP, type=int,
                         help="Max test samples per n_src")
-    parser.add_argument("--out",     default=None,
+    parser.add_argument("--out", default=None,
                         help="Output directory (default: DEFAULT_OUT_DIR)")
     parser.add_argument("--save-wav", action="store_true",
                         help="Save separated and mixture wav files under out_dir/wav/")
     parser.add_argument("--steps", type=int, default=None,
                         help=f"ODE Euler steps (default: EVAL_STEPS={EVAL_STEPS})")
-    parser.add_argument("--lambda-fixed", type=float, default=None, dest="lambda_fixed",
-                        help=(
-                            "Fixed CFG guidance scale for lambda sweep. "
-                            "Overrides both UQ guidance and alpha. "
-                            "0.0=conditioned only (no CFG), 1.5=same as default alpha. "
-                            "E.g.: --lambda-fixed 0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0"
-                        ))
     parser.add_argument("--lambda-scale", type=float, default=None, dest="lambda_scale",
                         help=(
                             "Enable diet/UQ-only guidance formula: λ*=clamp(σ_cond.mean×scale, max=2.0). "
                             "Typical value: 5.0  (matches training default lambda_scale=5.0)"
                         ))
     # Hidden args used internally by multi-GPU subprocess workers
-    parser.add_argument("--shard-rank",  type=int, default=0,  help=argparse.SUPPRESS)
-    parser.add_argument("--shard-world", type=int, default=1,  help=argparse.SUPPRESS)
-    parser.add_argument("--temp-out",    default=None,          help=argparse.SUPPRESS)
+    parser.add_argument("--shard-rank", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-world", type=int, default=1, help=argparse.SUPPRESS)
+    parser.add_argument("--temp-out", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     gpu_list = [int(x.strip()) for x in args.gpu.split(",")]
@@ -994,7 +680,6 @@ def main():
 
     out_dir = Path(args.out) if args.out else DEFAULT_OUT_DIR
     _eval_one_ckpt(ckpt_path, args, gpu_list, out_dir)
-
 
 if __name__ == "__main__":
     main()

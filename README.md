@@ -21,24 +21,24 @@ across increasing speaker counts and overlap ratios.
 
 ```
 MOUSSE/
-├── mousse/                     # importable library package
+├── mousse/
 │   ├── configs/
-│   │   └── config.py           # audio + model hyper-parameters (single source of truth)
+│   │   └── config.py
 │   ├── models/
-│   │   ├── audio_flow.py        # AudioFlow, UncertaintyHead, LearnedSinusoidalPosEmb
-│   │   ├── transformer.py       # Transformer backbone, ConvPositionEmbed, ALiBi/RoPE
-│   │   └── tensors.py           # RMSNorm, masking helpers, count_parameters
+│   │   ├── audio_flow.py
+│   │   ├── transformer.py
+│   │   └── tensors.py
 │   └── utils/
-│       ├── audio.py             # mel-spectrogram / STFT utilities
-│       ├── misc.py              # dict_to_object
+│       ├── audio.py
+│       ├── misc.py
 │       └── dataset/
-│           ├── mussed.py        # MUSSED mixture dataset + collate
-│           └── scp/             # test-set manifests (2spk / 3spk / 4spk)
+│           ├── mussed.py
+│           └── scp/
 ├── training/
-│   └── train.py                # single-stage PIT + UQ + entropy-weighted training
+│   └── train.py
 ├── inference/
-│   ├── eval.py                 # evaluation driver (SI-SNRi, SI-SDRi, STOI, PESQ, ...)
-│   └── eval.sh                 # reproduces the full evaluation suite from the paper
+│   ├── eval.py
+│   └── eval.sh
 ├── requirements.txt
 └── LICENSE
 ```
@@ -100,7 +100,7 @@ python training/train.py
 
 > Note: `training/train.py` pins `CUDA_VISIBLE_DEVICES = "2"` at the top of the
 > file (as used for the paper run). Edit that line for your own hardware.
-> Runs are logged to Weights & Biases under the project `mousse-stage1`.
+> Runs are logged to Weights & Biases under the project `mousse`.
 
 ## Evaluation
 
@@ -109,10 +109,7 @@ Set the checkpoint path and run the driver from the repository root:
 ```bash
 # edit CKPT="..." near the top of inference/eval.sh, then:
 bash inference/eval.sh main       # backbone + adaptive (cap = 1300, paper numbers)
-bash inference/eval.sh lambda     # fixed-lambda sweep
 bash inference/eval.sh adaptive   # adaptive lambda-scale sweep
-bash inference/eval.sh steps      # ODE-steps sweep
-bash inference/eval.sh sigma      # STO sigma analysis
 bash inference/eval.sh summary    # print summary tables from existing logs
 bash inference/eval.sh all        # everything
 ```
@@ -121,11 +118,11 @@ Or call the evaluator directly:
 
 ```bash
 python inference/eval.py \
-    --ckpt /path/to/large-sep-0820.best.pt \
-    --stage 1 --gpu 0 --cap 1300 \
-    --out results/stage1_uq/backbone_only
+    --ckpt /path/to/mousse-checkpoint.pt \
+    --gpu 0 --cap 1300 \
+    --out results/backbone_only
 ```
 
-Key flags: `--stage {1,2}`, `--ablation {full,no_uq,no_entropy}`, `--lambda-fixed`,
-`--lambda-scale`, `--steps`, `--cap`, `--gpu`, `--out`, `--save-wav`. See the
-module docstring in [inference/eval.py](inference/eval.py) for details.
+Key flags: `--ablation {full,no_uq,no_entropy}`, `--lambda-scale`, `--steps`,
+`--cap`, `--gpu`, `--out`, `--save-wav`. See the module docstring in
+[inference/eval.py](inference/eval.py) for details.
