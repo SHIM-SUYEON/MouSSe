@@ -71,7 +71,7 @@ scp/<N>spk/
 ```
 
 The paths inside the manifests point to the private MUSSED mixture set
-(`/shared/NAS_HDD/...`). To reproduce on another machine, regenerate the
+(`/data/...`). To reproduce on another machine, regenerate the
 mixtures and update the paths in the `.scp` files (or point `scp_base_dir` /
 symlink the audio to those locations). Speaker counts of 2, 3 and 4 are
 selected via the dataset key `mussed2` / `mussed3` / `mussed4`.
@@ -98,7 +98,7 @@ Evaluation seeds Python's RNG with `random.seed(42)`.
 python training/train.py
 ```
 
-> Note: `training/train.py` pins `CUDA_VISIBLE_DEVICES = "2"` at the top of the
+> Note: `training/train.py` pins `CUDA_VISIBLE_DEVICES = "0"` at the top of the
 > file (as used for the paper run). Edit that line for your own hardware.
 > Runs are logged to Weights & Biases under the project `mousse`.
 
@@ -108,7 +108,7 @@ Set the checkpoint path and run the driver from the repository root:
 
 ```bash
 # edit CKPT="..." near the top of inference/eval.sh, then:
-bash inference/eval.sh main       # backbone + adaptive (cap = 1300, paper numbers)
+bash inference/eval.sh main       # backbone + adaptive
 bash inference/eval.sh adaptive   # adaptive lambda-scale sweep
 bash inference/eval.sh summary    # print summary tables from existing logs
 bash inference/eval.sh all        # everything
