@@ -41,16 +41,12 @@ from mousse.utils.dataset import make_dataset
 from mousse.models.patches import apply_forward_patches
 from mousse.utils.vocoder import get_vocoder, do_vocoder
 
-
-# from pyannote.audio import Pipeline
-
-
 # Paths
 PRETRAINED_BACKBONE_PATH = Path(
-    "/shared/NAS_SSD/syshim/hi-d/bluejays/ss-librimix/librimix-sep-01.pt"
+    "./MOUSSE/checkpoint/backbone.01.pt"
 )
 SAVE_PATH = Path(
-    "/shared/NAS_SSD/syshim/hi-d/bluejays/speechflowuq/supervoice_separate/racoon-aug/single-stage/0826/"
+    "./MOUSSE/checkpoint/"
 )
 FT_VOCODER_PATH = None
 
@@ -64,33 +60,31 @@ FULL_SAVE_EV = [30000, 47500, 60000] # 10000
 FULL_EVAL_EV = 1000
 TRAIN_LOG_EVERY = 1
 
-# Early stopping (full-training only)
+# Early stopping
 # Fires after EARLY_STOP_PATIENCE_EVALS consecutive evals without ≥ EARLY_STOP_MIN_DELTA_DB gain.
 # At eval_every=1000 and patience=20 this means 20 000 steps without meaningful improvement.
 EARLY_STOP_PATIENCE_EVALS = 20
 EARLY_STOP_MIN_DELTA_DB = 0.2
 
-EXPERIMENT = "large-sep-0820"
+EXPERIMENT = "mousse-separation"
 
-MANUAL_HP: Dict[str, Any] = {
-    "lr_max": 1.40251473845546e-05,
-    "lr_start": 2.6475736370673437e-08,
+HYPERPARAM: Dict[str, Any] = {
+    "lr_max": 1.4e-5,
+    "lr_start": 2.6e-8,
     "warmup_steps": 4348,
-    "clip_norm": 0.08034961599688825,
-    "sigma": 3.2629595908661235e-06,
+    "clip_norm": 0.08,
+    "sigma": 3.3e-6,
     "batch_size": 4,
     "grad_accum": 4,
 }
 
-
 # Dataset / training constants
-
 N_SRC_LIST  = [2, 3, 4]
 VAL_SAMPLES_PER_NSRC = 1300 #100
 TRAIN_LOADER_WORKERS = 5
 TRAIN_MIXED_PRECISION = "bf16"
 MAX_FRAMES_PER_SPK = 600 #300
-MAX_EVAL_FRAMES_PER_SPK = 1500 #1200
+MAX_EVAL_FRAMES_PER_SPK = 1500
 
 train_project = "mousse"
 
@@ -786,15 +780,15 @@ def main():
     accelerator.print("Loading datasets...")
     train_loaders, val_loaders = load_datasets(batch_size=4)
 
-    best_hp = MANUAL_HP
-    accelerator.print(f"\nUsing HPs: {best_hp}")
+    hyperparameters = HYPERPARAM
+    accelerator.print(f"\nUsing HPs: {hyperparameters}")
 
     accelerator.print("\n" + "=" * 60)
     accelerator.print("Full training")
     accelerator.print("=" * 60)
-    accelerator.init_trackers(train_project, config={**best_hp})
+    accelerator.init_trackers(train_project, config={**hyperparameters})
     run_training(
-        hp=best_hp, steps=FULL_STEPS, eval_every=FULL_EVAL_EV, save_every=FULL_SAVE_EV,
+        hp=hyperparameters, steps=FULL_STEPS, eval_every=FULL_EVAL_EV, save_every=FULL_SAVE_EV,
         train_loaders=train_loaders, val_loaders=val_loaders, device=device,
         experiment_name=EXPERIMENT, save_path=SAVE_PATH, accelerator=accelerator, full_eval=True, pretrained_path=PRETRAINED_BACKBONE_PATH,
     )
