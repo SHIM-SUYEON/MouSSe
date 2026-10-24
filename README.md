@@ -125,13 +125,6 @@ Set the checkpoint path before running the driver from the repository root.
 The driver uses one GPU and runs each evaluation sequentially. The `GPU`
 setting in `inference/eval.sh` selects the device.
 
-```bash
-bash inference/eval.sh main       # backbone + adaptive
-bash inference/eval.sh adaptive   # adaptive lambda-scale sweep
-bash inference/eval.sh summary    # print summary tables from existing logs
-bash inference/eval.sh all        # everything
-```
-
 Or call the evaluator directly:
 
 ```bash
