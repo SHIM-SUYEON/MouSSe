@@ -10,6 +10,10 @@ accelerate==1.13.0
 wandb==0.27.0
 tqdm==4.67.3
 
+# Dataset generation only (mousse/utils/dataset/generate_mussed.py). pydub calls
+# ffmpeg, which must be installed separately through the system package manager.
+pydub==0.25.1
+
 # The waveform-domain evaluation metrics (STOI/PESQ/SI-SDR) synthesise audio
 # with an external vocoder loaded at runtime via torch.hub:
 #     torch.hub.load("ex3ndr/supervoice-vocoder", "bigvsan")

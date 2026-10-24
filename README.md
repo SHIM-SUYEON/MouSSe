@@ -33,6 +33,7 @@ MOUSSE/
 │       ├── misc.py
 │       └── dataset/
 │           ├── mussed.py
+│           ├── generate_mussed.py
 │           └── scp/
 ├── training/
 │   └── train.py
@@ -71,10 +72,26 @@ scp/<N>spk/
 ```
 
 The paths inside the manifests point to the private MUSSED mixture set
-(`/data/...`). To reproduce on another machine, regenerate the
-mixtures and update the paths in the `.scp` files (or point `scp_base_dir` /
-symlink the audio to those locations). Speaker counts of 2, 3 and 4 are
-selected via the dataset key `mussed2` / `mussed3` / `mussed4`.
+(`/data/...`). Reproduction on another machine requires regenerated mixtures
+and updated paths in the `.scp` files (or an `scp_base_dir` setting/symlink that
+resolves those locations). Speaker counts of 2, 3 and 4 are selected via the
+dataset key `mussed2` / `mussed3` / `mussed4`.
+
+### Regenerating the mixtures
+
+MUSSED is built from LibriTTS-R (English) and an internal Korean multi-speaker
+corpus by [mousse/utils/dataset/generate_mussed.py](mousse/utils/dataset/generate_mussed.py).
+The `Dataset paths` block at the top of the script defines the source and
+output locations. Mixture generation runs from the repository root:
+
+```bash
+python mousse/utils/dataset/generate_mussed.py
+```
+
+It writes `<N>spk/{raw,json}/` — the mixture `.wav` files plus a per-mixture
+metadata `.json` (speakers, overlap ratio, timings). Regenerate the `.scp`
+manifests from those outputs (or update the paths in the shipped `.scp` files).
+Requires `pydub` + `ffmpeg` (see `requirements.txt`).
 
 ## Configuration
 
@@ -99,7 +116,7 @@ python training/train.py
 ```
 
 > Note: `training/train.py` pins `CUDA_VISIBLE_DEVICES = "0"` at the top of the
-> file (as used for the paper run). Edit that line for your own hardware.
+> file (as used for the paper run). Change this value when selecting another GPU.
 > Runs are logged to Weights & Biases under the project `mousse`.
 
 ## Evaluation

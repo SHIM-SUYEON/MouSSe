@@ -4,7 +4,7 @@ The backbone (`AudioFlow` / `UncertaintyHead` / `LearnedSinusoidalPosEmb`) is
 patched at run time with numerically-safe forward implementations that also
 support JVP (forward-mode autodiff) used by the uncertainty head. These patches
 are identical for training and inference; the training-only branches
-(`self.training`) are simply dormant at inference time (`model.eval()`).
+(`self.training`) are inactive during inference (`model.eval()`).
 """
 
 import math

@@ -72,7 +72,7 @@ def spectogram(audio, n_fft, n_mels, n_hop, n_window, mel_norm, mel_scale, sampl
         window = window, 
         center = True,
         
-        onesided = True, # Default to true to real input, but we enforce it just in case
+        onesided = True, # Real-valued input requires a one-sided spectrum.
         return_complex = True
     )
 

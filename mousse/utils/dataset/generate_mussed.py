@@ -16,11 +16,19 @@ MAX_MIX_DUR_SEC = 15.0
 TARGET_SR = 16000
 OVERLAP_OPTIONS = [0.0, 0.25, 0.50, 0.75, 1.00]
 
-# Paths
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset paths
+# libri_dir contains SPEAKERS.txt and the train-clean-100, dev-clean, and
+# test-clean LibriTTS-R splits. The Korean corpus roots correspond to its
+# 1.Training and 2.Validation splits. Generated mixtures and metadata are
+# stored below output_base_dir.
+# ─────────────────────────────────────────────────────────────────────────────
 libri_dir = "/data/LibriTTS-R/LibriTTS_R/"
 kor_train_dir = "/data/korean-speech/014.multispeaker_audio_data/01.data/1.Training/"
 kor_val_dir = "/data/korean-speech/014.multispeaker_audio_data/01.data/2.Validation/"
 output_base_dir = "/data/MuSSeD/"
+
+# Paths derived from the dataset roots.
 output_train = os.path.join(output_base_dir, "train")
 output_dev = os.path.join(output_base_dir, "dev")
 output_test = os.path.join(output_base_dir, "test")
