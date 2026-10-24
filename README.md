@@ -138,9 +138,5 @@ Or call the evaluator directly:
 python inference/eval.py \
     --ckpt /path/to/mousse-checkpoint.pt \
     --gpu 0 --cap 1300 \
-    --out results/backbone_only
+    --out results/
 ```
-
-Key flags: `--ablation {full,no_uq,no_entropy}`, `--lambda-scale`, `--steps`,
-`--cap`, `--gpu`, `--out`, `--save-wav`. See the module docstring in
-[inference/eval.py](inference/eval.py) for details.
