@@ -79,7 +79,7 @@ dataset key `mussed2` / `mussed3` / `mussed4`.
 
 ### Regenerating the mixtures
 
-MUSSED is built from LibriTTS-R (English) and an internal Korean multi-speaker
+MUSSED is built from LibriTTS-R (English) and Korean multi-speaker
 corpus by [mousse/utils/dataset/generate_mussed.py](mousse/utils/dataset/generate_mussed.py).
 The `Dataset paths` block at the top of the script defines the source and
 output locations. Mixture generation runs from the repository root:
