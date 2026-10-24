@@ -1,8 +1,7 @@
-"""Neural vocoder loading and mel-to-waveform synthesis (shared by train/eval).
+"""Neural vocoder loading and mel-to-waveform synthesis.
 
-The waveform-domain metrics resynthesize audio with the external BigVSAN vocoder
-loaded via torch.hub (`ex3ndr/supervoice-vocoder`). Optionally a fine-tuned
-checkpoint can be loaded by setting FT_VOCODER_PATH.
+Waveform metrics use the external BigVSAN model from torch hub.
+FT_VOCODER_PATH selects an optional fine-tuned checkpoint.
 """
 
 import os
@@ -12,10 +11,10 @@ import torchaudio
 
 from mousse.configs import config
 
-# bigvsan generates at 24 kHz; do_vocoder resamples to config.audio.sample_rate (16 kHz).
+# bigvsan output is resampled from 24 kHz to the configured 16 kHz rate.
 VOCODER_SR = 24000
 
-# Set to a Path to load a fine-tuned vocoder checkpoint; otherwise the base weights are used.
+# Optional fine-tuned vocoder checkpoint path.
 FT_VOCODER_PATH = None
 
 _VOCODER_CACHE = None

@@ -67,7 +67,7 @@ class Transformer(nn.Module):
         rotational = None
 
         # Compute ALiBi
-        # This computes ALiBi bias mask, excluding non-bias tokens which are expected to be appended to the end of the sequence
+        # ALiBi bias excludes trailing non-bias tokens
         # Inspired by: https://github.com/ofirpress/attention_with_linear_biases/issues/5
         if self.position_embedding == 'alibi':
             alibi = get_alibi_mask(seq_len - self.n_non_bias_tokens, self.n_heads, self.cache_alibi, x.device)
@@ -115,19 +115,13 @@ class AttentionBlock(torch.nn.Module):
         # Attention input layer norm
         self.attention_ln = RMSNorm(n_dim)
 
-        # Input -> Query/Key/Value for each head in single tensor for speedup
+        # Combined query, key, and value projection
         self.attention = nn.Linear(n_dim, 3 * n_dim_head * n_heads, bias=False)
         torch.nn.init.normal_(self.attention.weight, mean=0.0, std=0.02)
-
-        # Attention dropout
-        # self.attention_dropout = nn.Dropout(att_dropout)
 
         # Output flatten multiple heads into single tensor
         self.attention_output = nn.Linear(n_dim_head * n_heads, n_dim, bias=False)
         torch.nn.init.normal_(self.attention_output.weight, mean=0.0, std=0.02)
-
-        # Attention dropout
-        # self.attention_output_dropout = nn.Dropout(dropout)
 
         # MLP part
         self.mlp_ln = RMSNorm(n_dim)
@@ -145,7 +139,7 @@ class AttentionBlock(torch.nn.Module):
         # Input normalization
         y = self.attention_ln(x)
 
-        # Calculation Q/K/V for each head
+        # Query, key, and value tensors
         q, k, v = self.attention(y).chunk(3, dim = -1)
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.n_heads), (q, k, v))
         
@@ -155,7 +149,6 @@ class AttentionBlock(torch.nn.Module):
             k = apply_rotary_pos_emb(rotational, k)
 
         # Dot product attention
-        # with torch.backends.cuda.sdp_kernel(enable_mem_efficient=True, enable_math=False): # Math backend is broken on mixed precision
         y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask = alibi if alibi is not None else None, dropout_p=self.att_dropout if self.training else 0.0) # Using ALiBi as a mask
 
         # Reassemble all head outputs side by side
@@ -163,7 +156,6 @@ class AttentionBlock(torch.nn.Module):
 
         # Output
         y = self.attention_output(y)
-        # y = self.attention_output_dropout(y)
 
         # Residual
         y = residual + y
@@ -202,7 +194,6 @@ class ConvPositionEmbed(nn.Module):
         return out
 
 
-# ALiBi implementation
 slopes_cache = {}
 def get_slopes_power_of_2(n_heads, device):
     global slopes_cache
@@ -245,7 +236,6 @@ def rotate_half(x):
     x1, x2 = x.chunk(2, dim = -1)
     return torch.cat((-x2, x1), dim = -1)
 
-# @autocast(enabled = False)
 @torch.amp.autocast('cuda', enabled=False)
 def apply_rotary_pos_emb(pos, t):
     return t * pos.cos() + rotate_half(t) * pos.sin()

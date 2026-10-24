@@ -1,4 +1,4 @@
-# Core dependencies for MouSSe (pinned to the versions used for the paper).
+# Core MouSSe dependencies pinned to the paper versions.
 torch==2.8.0
 torchaudio==2.8.0
 torchmetrics==1.9.0
@@ -10,11 +10,9 @@ accelerate==1.13.0
 wandb==0.27.0
 tqdm==4.67.3
 
-# Dataset generation only (mousse/utils/dataset/generate_mussed.py). pydub calls
-# ffmpeg, which must be installed separately through the system package manager.
+# Dataset generation dependency for mousse/utils/dataset/generate_mussed.py.
+# pydub requires a separate ffmpeg installation.
 pydub==0.25.1
 
-# The waveform-domain evaluation metrics (STOI/PESQ/SI-SDR) synthesise audio
-# with an external vocoder loaded at runtime via torch.hub:
-#     torch.hub.load("ex3ndr/supervoice-vocoder", "bigvsan")
-# No pip install is required for it, but network access is needed on first use.
+# Waveform metrics use the ex3ndr/supervoice-vocoder bigvsan model.
+# The first evaluation run requires network access for the model download.

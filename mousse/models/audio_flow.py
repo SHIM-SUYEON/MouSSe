@@ -10,10 +10,7 @@ from .tensors import drop_using_mask, merge_mask
 import torch.autograd.forward_ad as fwad
 
 class UncertaintyHead(torch.nn.Module):
-    """
-    Uncertainty Head designed to predict the heteroscedastic velocity variance 
-    over the exact same Time-Frequency resolution grid of the AudioFlow backbone.
-    """
+    """Predict velocity variance on the AudioFlow time-frequency grid."""
     def __init__(self, config):
         super(UncertaintyHead, self).__init__()
         self.config = config.model
@@ -25,7 +22,7 @@ class UncertaintyHead(torch.nn.Module):
         
         # Lightweight parallel Transformer blocks dedicated to variance modeling
         self.transformer = Transformer(
-            n_heads = max(2, self.config.n_heads // 2), # Resource efficient scaling
+            n_heads = max(2, self.config.n_heads // 2), # Reduced head count
             n_layers = max(2, self.config.n_layers // 2),
             n_dim = self.config.n_dim,
             n_dim_head = self.config.n_dim_head,
@@ -87,13 +84,10 @@ class AudioFlow(torch.nn.Module):
         # Prediction
         self.prediction = torch.nn.Linear(self.config.n_dim, config.audio.n_mels)
 
-    # def sample(self, *, audio, mask = None, steps, alpha = None, return_trajectory = False):
     @torch.inference_mode(False)
     def sample_with_uncertainty(self, *, audio, uq_head, steps, alpha = 1.5, lambda_max = 2.0):
-        
-        #
+
         # Prepare
-        #
         device = audio.device
         batch_size, seq_len, n_mels = audio.shape[0], audio.shape[1], audio.shape[2]
         
@@ -110,7 +104,6 @@ class AudioFlow(torch.nn.Module):
             audio_empty = torch.zeros_like(audio)
             audio_mix = torch.stack([audio_empty, audio], dim=0)
             z_mix = torch.stack([z, z], dim=0)
-            # t_mix = torch.stack([t_batch, t_batch], dim=0)
             t_mix = torch.cat([t_batch, t_batch], dim=0)
             
             # Compute extrapolated velocity mean field
@@ -139,33 +132,11 @@ class AudioFlow(torch.nn.Module):
             std_state = torch.sqrt(U.clamp(min=1e-8))
             v_vector = std_state * rademacher
             
-            # def local_velocity_fn(z_input):
-            #     mix_in = torch.stack([audio_empty, audio], dim=0)
-            #     z_in = torch.stack([z_input, z_input], dim=0)
-            #     t_in = torch.stack([t_batch, t_batch], dim=0)
-            #     out = self.forward(audio=mix_in, noise=z_in, times=t_in)
-                
-            #     out_guided = out[1]+(out[1]-out[0])*alpha
-                
-            #     return out_guided
-            
-            # def local_velocity_fn(z_input):
-            #     mix_in = torch.stack([audio_empty, audio], dim=0)
-            #     z_in = torch.stack([z_input, z_input], dim=0)
-            #     # t_in = torch.full((2, batch_size), t_curr, device=device, dtype=audio.dtype)
-            #     t_in = torch.full((2 * batch_size,), t_curr, device=device, dtype=audio.dtype)
-                
-            #     # Handle speaker identity conditions
-            #     c_in = torch.stack([condition, condition], dim=0) if condition is not None else None
-                
-            #     out = self.forward(audio=mix_in, noise=z_in, condition=c_in, times=t_in)
-            #     return out[1] + (out[1] - out[0]) * alpha
-            
             def local_velocity_fn(z_input):
                 audio_empty = torch.zeros_like(audio)
                 t_in = torch.full((batch_size,), t_curr, device=device, dtype=audio.dtype)
                 
-                # Run cond and uncond separately — halves SDPA peak allocation vs stacking
+                # Separate passes reduce SDPA memory
                 v_uncond = self.forward(audio=audio_empty, noise=z_input, times=t_in)
                 v_cond   = self.forward(audio=audio,       noise=z_input, times=t_in)
                 
@@ -173,8 +144,6 @@ class AudioFlow(torch.nn.Module):
             
             
             # Compute Jacobian-Vector Product tracking local spatial sensitivity
-            # _, jvp_out = torch.autograd.functional.jvp(local_velocity_fn, (z,), (v_vector,))
-            
             with fwad.dual_level():
                 z_dual = fwad.make_dual(z, v_vector)
                 out_dual = local_velocity_fn(z_dual)
@@ -217,7 +186,6 @@ class AudioFlow(torch.nn.Module):
         if condition is not None:
             output = output + condition
 
-        # sinu_times = self.sinu_pos_emb(times).unsqueeze(1)
         raw_sinu_times = self.sinu_pos_emb(times)
         if output.ndim == 4 and raw_sinu_times.ndim == 2:
             sinu_times = raw_sinu_times.unsqueeze(1).unsqueeze(1) # Align to 4D: [2, 1, 1, Features]
@@ -253,7 +221,6 @@ class LearnedSinusoidalPosEmb(torch.nn.Module):
         self.weights = torch.nn.Parameter(torch.randn(half_dim))
 
     def forward(self, x):
-        # x = x.flatten()
         x = rearrange(x, 'b -> b 1')
         freqs = x * rearrange(self.weights, 'd -> 1 d') * 2 * math.pi
         fouriered = torch.cat((freqs.sin(), freqs.cos()), dim = -1)

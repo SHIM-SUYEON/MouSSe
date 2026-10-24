@@ -67,7 +67,7 @@ file. The test-set manifests (1300 mixtures per speaker count) ship in
 
 ```
 scp/<N>spk/
-  tt_mix_clean.scp   # mixtures            (tt = test, cv = dev, tr = train)
+  tt_mix_clean.scp   # mixtures; tt test, cv dev, tr train
   tt_s1.scp ...      # per-source targets
 ```
 
@@ -121,10 +121,11 @@ python training/train.py
 
 ## Evaluation
 
-Set the checkpoint path and run the driver from the repository root:
+Set the checkpoint path before running the driver from the repository root.
+The driver uses one GPU and runs each evaluation sequentially. The `GPU`
+setting in `inference/eval.sh` selects the device.
 
 ```bash
-# edit CKPT="..." near the top of inference/eval.sh, then:
 bash inference/eval.sh main       # backbone + adaptive
 bash inference/eval.sh adaptive   # adaptive lambda-scale sweep
 bash inference/eval.sh summary    # print summary tables from existing logs

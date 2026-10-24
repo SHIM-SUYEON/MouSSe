@@ -1,10 +1,7 @@
-"""Runtime monkey-patches and conditioning helpers shared by training and inference.
+"""Runtime forward patches shared by training and inference.
 
-The backbone (`AudioFlow` / `UncertaintyHead` / `LearnedSinusoidalPosEmb`) is
-patched at run time with numerically-safe forward implementations that also
-support JVP (forward-mode autodiff) used by the uncertainty head. These patches
-are identical for training and inference; the training-only branches
-(`self.training`) are inactive during inference (`model.eval()`).
+The patched forward pass supports stable JVP uncertainty estimation.
+Evaluation mode disables training-only branches.
 """
 
 import math
@@ -82,12 +79,7 @@ def generic_safe_forward(self, *, audio, noise, condition=None, times, mask=None
 
 
 def apply_forward_patches():
-    """Install the shared forward patches on the backbone module classes.
-
-    Returns the patched `mousse.models.audio_flow` module so that callers can
-    add further patches (training additionally sets
-    `AudioFlow.sample_with_uncertainty`).
-    """
+    """Install shared forward patches and return the patched module."""
     import mousse.models.audio_flow as sf_model
     sf_model.LearnedSinusoidalPosEmb.forward = safe_sinu_forward
     sf_model.AudioFlow.forward = generic_safe_forward

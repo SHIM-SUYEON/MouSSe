@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-# eval.sh
-#
-# Evaluation driver for the MUSSE PIT+UQ speech-separation model.
-# Experiments run in parallel pairs on 2 GPUs (GPU_A, GPU_B).
-# Run from the repository root, e.g.  bash inference/eval.sh main
-#
-# Usage:
-# bash inference/eval.sh            # everything (main + adaptive sweep + summary)
-# bash inference/eval.sh main       # backbone + adaptive (cap=1300, paper numbers)
-# bash inference/eval.sh adaptive   # adaptive lambda-scale sweep
-# bash inference/eval.sh summary    # print summary tables from existing logs
 
 set -euo pipefail
 
@@ -20,8 +9,7 @@ OUT_BASE="results/mousse_uq"
 LOG_DIR="logs/mousse_uq_1300"
 
 # Config 
-GPU_A="0"      # first GPU
-GPU_B="1"      # second GPU
+GPU="0"
 CAP_MAIN=1300  # full test set for final reported numbers
 CAP_SWEEP=1300 # adaptive lambda-scale sweep
 
@@ -29,74 +17,62 @@ mkdir -p "$LOG_DIR"
 
 # Helpers 
 _run() {
-    # _run <log> <extra args...>
     local log="$1"; shift
     echo "[RUN] $* → $log"
     python3 -u "$SCRIPT" "$@" > "$log" 2>&1
 }
 
 run_adaptive() {
-    local scale="$1" gpu="$2" cap="${3:-$CAP_SWEEP}"
+    local scale="$1" cap="${2:-$CAP_SWEEP}"
     local tag; tag=$(echo "$scale" | tr '.' '_')
     local log="$LOG_DIR/adaptive_scale_${tag}.log"
     local out="$OUT_BASE/adaptive_scale_${tag}"
     _run "$log" --ckpt "$CKPT" \
-        --lambda-scale "$scale" --gpu "$gpu" --cap "$cap" --out "$out"
+        --lambda-scale "$scale" --gpu "$GPU" --cap "$cap" --out "$out"
 }
 
-# Section 0: Main comparison (full cap=1300 for paper numbers) 
 run_main() {
     echo ""
     echo "======================================================================"
-    echo " MAIN  (CAP=$CAP_MAIN — for paper numbers)"
+    echo " MAIN  (CAP=$CAP_MAIN)"
     echo "======================================================================"
 
-    # Backbone baseline (no UQ guidance, fixed alpha=1.5)
+    # Backbone baseline with fixed alpha 1.5
     LOG_BB="$LOG_DIR/main_backbone.log"
     _run "$LOG_BB" \
         --ckpt "$CKPT" --ablation no_uq \
-        --gpu "$GPU_A" --cap "$CAP_MAIN" \
-        --out "$OUT_BASE/main_backbone" &
-    PID_A=$!
+        --gpu "$GPU" --cap "$CAP_MAIN" \
+        --out "$OUT_BASE/main_backbone"
 
-    # Adaptive UQ guidance (lambda_scale=1.0 → lambda* ≈ 0.50)
+    # Adaptive UQ guidance at lambda scale 1.0
     LOG_AD="$LOG_DIR/main_adaptive_1_0.log"
     _run "$LOG_AD" \
         --ckpt "$CKPT" --lambda-scale 1.0 \
-        --gpu "$GPU_B" --cap "$CAP_MAIN" \
-        --out "$OUT_BASE/main_adaptive_1_0" &
-    PID_B=$!
+        --gpu "$GPU" --cap "$CAP_MAIN" \
+        --out "$OUT_BASE/main_adaptive_1_0"
 
-    wait $PID_A $PID_B
     echo "[main] backbone + adaptive_1.0 done."
 }
 
-# Section 1: Adaptive-lambda (lambda_scale) sweep 
 run_adaptive_sweep() {
     echo ""
     echo "======================================================================"
     echo " ADAPTIVE LAMBDA_SCALE SWEEP  (CAP=$CAP_SWEEP)"
     echo "======================================================================"
 
-    run_adaptive 0.0  "$GPU_A" "$CAP_SWEEP" &
-    wait
-
-    run_adaptive 0.5  "$GPU_A" "$CAP_SWEEP" &
-    run_adaptive 1.0  "$GPU_B" "$CAP_SWEEP" &
-    wait
-
-    run_adaptive 1.5  "$GPU_A" "$CAP_SWEEP" &
-    run_adaptive 2.0  "$GPU_B" "$CAP_SWEEP" &
-    wait
+    run_adaptive 0.0 "$CAP_SWEEP"
+    run_adaptive 0.5 "$CAP_SWEEP"
+    run_adaptive 1.0 "$CAP_SWEEP"
+    run_adaptive 1.5 "$CAP_SWEEP"
+    run_adaptive 2.0 "$CAP_SWEEP"
 
     echo "[sweep] Adaptive lambda_scale sweep complete."
 }
 
-# Section 2: Summary 
 print_summary() {
     echo ""
     echo "======================================================================"
-    echo " SUMMARY  (SDRi, SI-SDRi, ESTOI, ESTOIi from [OVERALL] lines)"
+    echo " SUMMARY: SDRi, SI-SDRi, ESTOIi"
     echo "======================================================================"
 
     echo ""

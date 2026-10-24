@@ -56,7 +56,7 @@ def resampler(from_sample_rate, to_sample_rate, device=None):
         resampler_cache[key] = res
         return res
 
-# Spectogram caclulcation
+# Spectrogram calculation
 def spectogram(audio, n_fft, n_mels, n_hop, n_window, mel_norm, mel_scale, sample_rate):
 
     # Hann Window
@@ -76,10 +76,7 @@ def spectogram(audio, n_fft, n_mels, n_hop, n_window, mel_norm, mel_scale, sampl
         return_complex = True
     )
 
-    # Compute magnitudes (|a + ib| = sqrt(a^2 + b^2)) instead of power spectrum (|a + ib|^2 = a^2 + b^2)
-    # because magnitude and phase is linear to the input, while power spectrum is quadratic to the input
-    # and the magnitude is easier to learn for vocoder
-    # magnitudes = stft[..., :-1].abs() ** 2 # Power
+    # Magnitude spectrum preserves linear amplitude scaling
     magnitudes = stft[..., :-1].abs() # Amplitude
 
     # Mel Log Bank

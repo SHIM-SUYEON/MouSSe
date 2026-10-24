@@ -17,7 +17,7 @@ results/
 logs/
 output/
 
-# Figures / audio / serialized metrics (not tracked; regenerate from code)
+# Regenerated figures, audio, and serialized metrics
 *.png
 *.jpg
 *.jpeg
@@ -26,7 +26,7 @@ output/
 *.flac
 *.json
 
-# ...but keep the curated demo figures shown in the README
+# Curated demo figures used in the README
 !assets/
 !assets/**
 

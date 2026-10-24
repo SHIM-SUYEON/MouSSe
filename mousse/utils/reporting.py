@@ -1,12 +1,6 @@
-"""Metric accumulation, category breakdown, and summary reporting for evaluation.
+"""Metric accumulation and summary reporting for evaluation.
 
-These helpers are inference/eval only (not used by training). They collect
-per-sample metrics into accumulators, break them down by language / gender /
-overlap categories, print the summary + cross tables, and assemble the final
-results dict written to JSON.
-
-The set of speaker counts to report over is passed in explicitly as
-``n_src_list`` so this module has no dependency on the eval script's globals.
+Metrics are grouped by language, gender, overlap, and speaker count.
 """
 
 import json
@@ -26,20 +20,17 @@ def _make_acc():
     return {
         "sisdri": 0.0, "n_sisdri": 0,         # SI-SDRi
         "sdri": 0.0, "n_sdri": 0,             # SDRi
-        "estoi": 0.0, "n_estoi": 0,           # Extended STOI
         "estoii": 0.0, "n_estoii": 0,         # ESTOi improvement over mixture baseline
         "uq": 0.0, "n_uq": 0,                 # UQ sigma_cond
         "n_samples": 0,
     }
 
 
-def _acc_add(acc, sisdri=None, sdri=None, estoi=None, estoii=None, uq=None):
+def _acc_add(acc, sisdri=None, sdri=None, estoii=None, uq=None):
     if sisdri is not None:
         acc["sisdri"] += sisdri; acc["n_sisdri"] += 1
     if sdri is not None:
         acc["sdri"] += sdri; acc["n_sdri"] += 1
-    if estoi is not None:
-        acc["estoi"] += estoi; acc["n_estoi"] += 1
     if estoii is not None:
         acc["estoii"] += estoii; acc["n_estoii"] += 1
     if uq is not None:
@@ -47,9 +38,9 @@ def _acc_add(acc, sisdri=None, sdri=None, estoi=None, estoii=None, uq=None):
 
 
 def _merge_acc(dst, src):
-    for k in ("sisdri", "sdri", "estoi", "estoii", "uq"):
+    for k in ("sisdri", "sdri", "estoii", "uq"):
         dst[k] += src[k]
-    for k in ("n_sisdri", "n_sdri", "n_estoi", "n_estoii", "n_uq", "n_samples"):
+    for k in ("n_sisdri", "n_sdri", "n_estoii", "n_uq", "n_samples"):
         dst[k] += src[k]
 
 def _avg(acc, metric):
@@ -60,7 +51,7 @@ def _avg(acc, metric):
         float("nan")
 
 def _load_meta(mix_path):
-    """Load JSON metadata (language, gender, overlap, duration) for a mixture."""
+    """Load language, gender, overlap, and duration metadata."""
     p = Path(mix_path)
     json_path = p.parent.parent / "json" / (p.stem + ".json")
     try:
@@ -77,7 +68,7 @@ def _load_meta(mix_path):
         return None
 
 def _categorize(meta):
-    """Return (lang_cat, gender_cat, overlap_cat) strings, or None if unknown."""
+    """Return language, gender, and overlap categories."""
     if meta is None:
         return None, None, None
     n = len(meta["langs"])
@@ -96,7 +87,6 @@ def _categorize(meta):
 def _fmt_metrics(acc):
     dr = _avg(acc, "sdri")      # SDRi
     sd = _avg(acc, "sisdri")    # SI-SDRi
-    et = _avg(acc, "estoi")     # ESTOI
     eti = _avg(acc, "estoii")   # ESTOIi
     uq = _avg(acc, "uq")
     def _f2(v): return f"{v:6.2f}" if not math.isnan(v) else "  N/A "
@@ -104,7 +94,7 @@ def _fmt_metrics(acc):
     def _f6(v): return f"{v:.6f}" if not math.isnan(v) else "  N/A"
     return (
         f"SDRi={_f2(dr)} dB  SI-SDRi={_f2(sd)} dB  "
-        f"ESTOI={_f4(et)}  ESTOIi={_f4(eti)}  UQ(sigma)={_f6(uq)}"
+        f"ESTOIi={_f4(eti)}  UQ(sigma)={_f6(uq)}"
     )
 
 def _fmt_cell(acc, metric):
@@ -117,7 +107,7 @@ def _fmt_cell(acc, metric):
     return f"{val:11.4f}"
 
 def _print_category_summary(nsrc_acc, cat_acc, n_src_list):
-    """Print per-category summary (first table)."""
+    """Print the category summary."""
 
     def row(cat_type, value, acc):
         n = acc["n_samples"]
@@ -165,11 +155,10 @@ def _print_category_summary(nsrc_acc, cat_acc, n_src_list):
         print(row("overlap", f"{c}%", ovlp_agg[c]))
 
 def _print_cross_table(cat_acc, n_src_list):
-    """Print cross-tables (one per metric)."""
+    """Print one cross table per metric."""
     METRICS = [
         ("sdri", "SDRi (dB)"),
         ("sisdri", "SI-SDRi (dB)"),
-        ("estoi", "ESTOI"),
         ("estoii", "ESTOIi"),
         # Model uncertainty
         ("uq", "UQ sigma_cond"),
@@ -204,7 +193,7 @@ def _print_cross_table(cat_acc, n_src_list):
             print(f"{n:>6d} |{lang_cells}|{ovlp_cells}|{gndr_cells}")
 
 def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
-    """Print summary tables, build and return the full results dict."""
+    """Print summaries and return the result dictionary."""
     _print_category_summary(nsrc_acc, cat_acc, n_src_list)
     _print_cross_table(cat_acc, n_src_list)
 
@@ -216,7 +205,6 @@ def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
             "n_samples": acc["n_samples"],
             "sdri": _jv(_avg(acc, "sdri")), "n_sdri": acc["n_sdri"],
             "si_sdri": _jv(_avg(acc, "sisdri")), "n_sisdri": acc["n_sisdri"],
-            "estoi": _jv(_avg(acc, "estoi")), "n_estoi": acc["n_estoi"],
             "estoii": _jv(_avg(acc, "estoii")), "n_estoii": acc["n_estoii"],
             "uq_sigma": _jv(_avg(acc, "uq")), "n_uq": acc["n_uq"],
         }
@@ -238,7 +226,6 @@ def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
     results["overall"] = {
         "sdri_avg": _jv(_nm("sdri")),
         "si_sdri_avg": _jv(_nm("sisdri")),
-        "estoi_avg": _jv(_nm("estoi")),
         "estoii_avg": _jv(_nm("estoii")),
         "uq_sigma_avg": _jv(_nm("uq")),
     }
@@ -251,7 +238,7 @@ def _finalize_results(nsrc_acc, cat_acc, per_sample_records, n_src_list):
         f"\n[OVERALL]  "
         f"SDRi={_f2(ov['sdri_avg'])} dB  "
         f"SI-SDRi={_f2(ov['si_sdri_avg'])} dB  "
-        f"ESTOI={_f4(ov['estoi_avg'])}  ESTOIi={_f4(ov['estoii_avg'])}  "
+        f"ESTOIi={_f4(ov['estoii_avg'])}  "
         f"UQ(sigma)={_f6(ov['uq_sigma_avg'])}"
     )
     results["per_sample"] = per_sample_records

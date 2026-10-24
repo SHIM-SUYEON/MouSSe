@@ -5,15 +5,9 @@ import json
 import math
 import argparse
 import random
-import subprocess
-import tempfile
-import pickle
-import shutil
 import warnings
 from pathlib import Path
 
-# Make the top-level ``mousse`` package importable when running this script
-# directly (repo root is the parent of this inference/ directory).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
@@ -44,7 +38,7 @@ from mousse.utils.vocoder import get_vocoder, do_vocoder
 from mousse.utils.signal import rms_normalize
 from mousse.utils.reporting import (
     LANG_CATS, GENDER_CATS, OVERLAP_CATS,
-    _make_acc, _acc_add, _merge_acc, _avg,
+    _make_acc, _acc_add, _avg,
     _load_meta, _categorize, _finalize_results,
 )
 
@@ -76,9 +70,8 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                       lambda_max=2.0, use_uq_guidance=True, condition=None,
                       lambda_scale=None):
     """ODE Euler sampler.
-    lambda_scale: if set (float), enables the diet/UQ-only formula:
-                  lambda* = clamp(sigma_cond.mean * lambda_scale, max=lambda_max)
-                  (UQ-only; no sigma_uncond term).
+
+    A lambda scale enables guidance based only on conditional uncertainty.
     """
     device = audio.device
     batch_size = audio.shape[0]
@@ -111,7 +104,7 @@ def fast_euler_sample(predictor, uq_head, audio, steps=16, alpha=1.5,
                         print(f"lambda_star step0  mean={lambda_star.mean():.3f}  max={lambda_star.max():.3f}  frac_clamped={(lambda_star >= lambda_max).float().mean():.3f}", flush=True)
                     v_guided = v_cond + (v_cond - v_uncond) * lambda_star
                 elif use_uq_guidance:
-                    # lambda* = clamp(num/den, 0, lambda_max)
+                    # Adaptive guidance weight
                     v_uncond = predictor(audio=audio_empty, noise=z, times=t_batch)
                     log_s_uncond = uq_head(audio=audio, noise=z, times=t_batch)
                     log_s_cond = uq_head(audio=audio, noise=z, times=t_batch, condition=condition)
@@ -146,7 +139,7 @@ def _snr_val(preds: torch.Tensor, target: torch.Tensor) -> float:
 def _eval_loop(backbone, uq_head, test_loaders, device,
                out_dir=None, save_wav=False, ablation='full', eval_steps=None,
                lambda_scale=None):
-    """Run the evaluation loop and return raw accumulators (no printing of final tables)."""
+    """Run evaluation and return metric accumulators."""
 
     _ABLATION_VALID = ("full", "no_uq", "no_entropy")
     if ablation not in _ABLATION_VALID:
@@ -174,7 +167,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
     if out_dir is not None:
         os.makedirs(out_dir, exist_ok=True)
 
-    # Accumulators
+    # Metric accumulators
     nsrc_acc = {n: _make_acc() for n in N_SRC_LIST}
     cat_acc = {
         n: {
@@ -247,7 +240,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
             lang, gender, overlap = _categorize(meta)
             stem = Path(mix_paths[0]).stem
 
-            # Load mix wav (needed for SI-SDRi baseline and optional save)
+            # Mixture waveform for SI-SDRi and output
             sample_dir = wav_dir / stem if wav_dir is not None else None
             wav_mix = None
             try:
@@ -287,7 +280,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                     if lang    and lang    in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], uq=uq_val)
                     if gender  and gender  in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], uq=uq_val)
                     if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], uq=uq_val)
-                spk_rec = {"sisdri": None, "sdri": None, "estoi": None, "estoii": None, "uq_sigma_mean": uq_val}
+                spk_rec = {"sisdri": None, "sdri": None, "estoii": None, "uq_sigma_mean": uq_val}
 
                 if vocoder is not None:
                     src_mel_frames = T_per_spk
@@ -327,7 +320,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                         wav_t_n.pow(2).mean().sqrt().item() >= _MIN_RMS
                     )
 
-                    # SI-SDRi + SDRi (improvement over mixture baseline)
+                    # SI-SDRi and SDRi against the mixture baseline
                     if has_speech and wav_mix is not None:
                         try:
                             tgt_len = wav_t_n.shape[-1]
@@ -359,17 +352,11 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                         except Exception as e:
                             print(f"  [SI-SDRi/SDRi] error spk={pi}: {e}")
 
-                    # ESTOI (absolute) + ESTOIi (improvement over mixture baseline)
+                    # ESTOI improvement over the mixture baseline
                     if has_speech and wav_p_n.shape[-1] >= int(sr * 0.5):
                         try:
-                            estoi_val = estoi_m(wav_p_n, wav_t_n).item()
-                            if not (math.isnan(estoi_val) or math.isinf(estoi_val)):
-                                spk_rec["estoi"] = round(estoi_val, 4)
-                                _acc_add(nsrc_acc[n_src], estoi=estoi_val)
-                                if lang and lang in LANG_CATS: _acc_add(cat_acc[n_src]["lang"][lang], estoi=estoi_val)
-                                if gender and gender in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], estoi=estoi_val)
-                                if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoi=estoi_val)
-
+                            estoi_sep_val = estoi_m(wav_p_n, wav_t_n).item()
+                            if not (math.isnan(estoi_sep_val) or math.isinf(estoi_sep_val)):
                                 if wav_mix is not None:
                                     tgt_w_len = wav_t_n.shape[-1]
                                     mix_for_stoi = wav_mix[:tgt_w_len]
@@ -378,7 +365,7 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                                     mix_stoi_n = rms_normalize(mix_for_stoi)
                                     if mix_stoi_n.shape[-1] >= int(sr * 0.5):
                                         estoi_mix_val = estoi_m(mix_stoi_n, wav_t_n).item()
-                                        estoii_val = estoi_val - estoi_mix_val
+                                        estoii_val = estoi_sep_val - estoi_mix_val
                                         if not (math.isnan(estoii_val) or math.isinf(estoii_val)):
                                             spk_rec["estoii"] = round(estoii_val, 4)
                                             _acc_add(nsrc_acc[n_src], estoii=estoii_val)
@@ -386,19 +373,18 @@ def _eval_loop(backbone, uq_head, test_loaders, device,
                                             if gender and gender in GENDER_CATS: _acc_add(cat_acc[n_src]["gender"][gender], estoii=estoii_val)
                                             if overlap and overlap in OVERLAP_CATS: _acc_add(cat_acc[n_src]["overlap"][overlap], estoii=estoii_val)
                         except Exception as e:
-                            print(f"  [ESTOI] error spk={pi}: {e}")
+                            print(f"  [ESTOIi] error spk={pi}: {e}")
 
                 record[spk_key] = spk_rec
 
             per_sample_records.append(record)
 
-        # Per-n_src progress report
+        # Speaker count summary
         acc = nsrc_acc[n_src]
         print(
             f"[n_src={n_src}]  "
             f"SDRi={_avg(acc,'sdri'):.2f} dB (n={acc['n_sdri']})  "
             f"SI-SDRi={_avg(acc,'sisdri'):.2f} dB (n={acc['n_sisdri']})  "
-            f"ESTOI={_avg(acc,'estoi'):.4f} (n={acc['n_estoi']})  "
             f"ESTOIi={_avg(acc,'estoii'):.4f} (n={acc['n_estoii']})  "
             f"UQ={_avg(acc,'uq'):.6f} (n={acc['n_uq']})  "
             f"[dur_skipped(>{MAX_MIX_DURATION}s): {dur_skip_cnt}]"
@@ -450,7 +436,7 @@ def _save_results(results, out_dir, ckpt_path, args):
 
     per_sample = results.pop("per_sample", [])
     # Metrics kept per speaker slot.
-    KEEP_SPK = ("sisdri", "sdri", "estoi", "estoii", "uq_sigma_mean")
+    KEEP_SPK = ("sisdri", "sdri", "estoii", "uq_sigma_mean")
     per_sample_trim = []
     for rec in per_sample:
         out = {k: rec.get(k) for k in ("stem", "n_src", "lang", "gender", "overlap")}
@@ -477,7 +463,6 @@ def _save_results(results, out_dir, ckpt_path, args):
                 "speaker_slot": spk_key,
                 "sisdri": sd.get("sisdri"),
                 "sdri": sd.get("sdri"),
-                "estoi": sd.get("estoi"),
                 "estoii": sd.get("estoii"),
                 "uq_sigma_mean": sd.get("uq_sigma_mean"),
             })
@@ -495,86 +480,25 @@ def _save_results(results, out_dir, ckpt_path, args):
     print(f"[EVAL] Aggregate results saved to {results_path}")
 
 
-def _build_test_loaders(args, shard_rank=0, shard_world=1):
-    """Build per-n_src DataLoaders, sharded for multi-GPU workers."""
+def _build_test_loaders(args):
+    """Build test loaders for each speaker count."""
     test_loaders = {}
     for n in N_SRC_LIST:
         ds = make_dataset(setting=f"mussed{n}", cache_path="/tmp", subset="test")
         n_total = len(ds)
         n_use = min(args.cap, n_total)
-        all_indices = list(range(n_use))[:TEST_CAP + 1]
-        if shard_world > 1:
-            indices = all_indices[shard_rank::shard_world]
-        else:
-            indices = all_indices
+        indices = list(range(n_use))[:TEST_CAP + 1]
         ds_use = Subset(ds, indices)
         test_loaders[n] = DataLoader(
             ds_use, batch_size=1, shuffle=False,
             num_workers=2, collate_fn=ds.collate,
         )
-        print(f"  n_src={n}: {len(indices)} samples"
-              + (f" (shard {shard_rank+1}/{shard_world})" if shard_world > 1 else f" / {n_total} total"))
+        print(f"  n_src={n}: {len(indices)} samples / {n_total} total")
     return test_loaders
 
 
-def _multi_gpu_eval(ckpt_path, args, gpu_list, out_dir):
-    """Spawn one subprocess per GPU; each evaluates its data shard; main merges."""
-    temp_dir = Path(tempfile.mkdtemp(prefix="eval_mgpu_"))
-    procs, temp_files = [], []
-    try:
-        for rank, gid in enumerate(gpu_list):
-            tmp_pkl = str(temp_dir / f"rank{rank}.pkl")
-            temp_files.append(tmp_pkl)
-            cmd = [
-                sys.executable, __file__,
-                "--ckpt", str(ckpt_path),
-                "--gpu", str(gid),
-                "--ablation", args.ablation,
-                "--cap", str(args.cap),
-                "--out", str(out_dir),
-                f"--shard-rank={rank}",
-                f"--shard-world={len(gpu_list)}",
-                f"--temp-out={tmp_pkl}",
-            ] + (["--save-wav"] if args.save_wav else []) \
-              + (["--steps", str(args.steps)] if getattr(args, 'steps', None) else []) \
-              + (["--lambda-scale", str(args.lambda_scale)] if getattr(args, 'lambda_scale', None) is not None else [])
-            print(f"[EVAL] Spawning worker rank={rank} on GPU {gid}")
-            procs.append(subprocess.Popen(cmd))
-
-        exit_codes = [p.wait() for p in procs]
-        if any(c != 0 for c in exit_codes):
-            print(f"[ERROR] Some workers failed: exit codes = {exit_codes}")
-            sys.exit(1)
-
-        print("\n[EVAL] All workers done. Merging results...")
-        merged_nsrc = {n: _make_acc() for n in N_SRC_LIST}
-        merged_cat = {
-            n: {
-                "lang": {c: _make_acc() for c in LANG_CATS},
-                "gender": {c: _make_acc() for c in GENDER_CATS},
-                "overlap": {c: _make_acc() for c in OVERLAP_CATS},
-            }
-            for n in N_SRC_LIST
-        }
-        merged_per_sample = []
-        for pkl in temp_files:
-            with open(pkl, "rb") as f:
-                nsrc_acc, cat_acc, per_sample = pickle.load(f)
-            for n in N_SRC_LIST:
-                _merge_acc(merged_nsrc[n], nsrc_acc[n])
-                for c in LANG_CATS: _merge_acc(merged_cat[n]["lang"][c], cat_acc[n]["lang"][c])
-                for c in GENDER_CATS: _merge_acc(merged_cat[n]["gender"][c], cat_acc[n]["gender"][c])
-                for c in OVERLAP_CATS: _merge_acc(merged_cat[n]["overlap"][c], cat_acc[n]["overlap"][c])
-            merged_per_sample.extend(per_sample)
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    results = _finalize_results(merged_nsrc, merged_cat, merged_per_sample, N_SRC_LIST)
-    _save_results(results, out_dir, ckpt_path, args)
-
-
-def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world=1):
-    """Run evaluation on one GPU (possibly a shard for multi-GPU mode)."""
+def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir):
+    """Run evaluation on one GPU."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[EVAL] Device: {device}  GPU={gpu_id}")
@@ -584,7 +508,7 @@ def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world
     backbone, uq_head = load_checkpoint(ckpt_path, device)
 
     print(f"\n[EVAL] Building test loaders (cap={args.cap} per n_src)...")
-    test_loaders = _build_test_loaders(args, shard_rank=shard_rank, shard_world=shard_world)
+    test_loaders = _build_test_loaders(args)
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -598,30 +522,17 @@ def _single_gpu_eval(ckpt_path, args, gpu_id, out_dir, shard_rank=0, shard_world
     )
 
 
-def _eval_one_ckpt(ckpt_path, args, gpu_list, out_dir):
-    """Evaluate a single checkpoint (dispatches single- or multi-GPU)."""
+def _eval_one_ckpt(ckpt_path, args, gpu_id, out_dir):
+    """Evaluate one checkpoint on the selected GPU."""
     if not Path(ckpt_path).exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
     out_dir = Path(out_dir)
-    is_worker = args.shard_world > 1 and args.temp_out is not None
-
-    if len(gpu_list) > 1 and not is_worker:
-        _multi_gpu_eval(ckpt_path, args, gpu_list, out_dir)
-    else:
-        gpu_id = gpu_list[0]
-        nsrc_acc, cat_acc, per_sample = _single_gpu_eval(
-            ckpt_path, args, gpu_id, out_dir,
-            shard_rank=args.shard_rank, shard_world=args.shard_world,
-        )
-        if is_worker:
-            # Worker mode: dump accumulators for the main process to merge
-            with open(args.temp_out, "wb") as f:
-                pickle.dump((nsrc_acc, cat_acc, per_sample), f)
-            print(f"[WORKER rank={args.shard_rank}] Saved shard results to {args.temp_out}")
-        else:
-            results = _finalize_results(nsrc_acc, cat_acc, per_sample, N_SRC_LIST)
-            _save_results(results, out_dir, ckpt_path, args)
+    nsrc_acc, cat_acc, per_sample = _single_gpu_eval(
+        ckpt_path, args, gpu_id, out_dir,
+    )
+    results = _finalize_results(nsrc_acc, cat_acc, per_sample, N_SRC_LIST)
+    _save_results(results, out_dir, ckpt_path, args)
 
 # Entry point 
 def main():
@@ -630,8 +541,8 @@ def main():
     )
     parser.add_argument("--ckpt", default=str(DEFAULT_CKPT),
                         help="Path to .pt checkpoint, OR a directory to evaluate all .pt files inside")
-    parser.add_argument("--gpu", default="4",
-                        help="Single GPU id ('4') or comma-separated list for multi-GPU ('0,1,2,3')")
+    parser.add_argument("--gpu", default=0, type=int,
+                        help="GPU id")
     parser.add_argument("--ablation", default="full",
                         choices=["full", "no_uq", "no_entropy"],
                         help=(
@@ -653,17 +564,12 @@ def main():
                             "Enable diet/UQ-only guidance formula: λ*=clamp(σ_cond.mean×scale, max=2.0). "
                             "Typical value: 5.0  (matches training default lambda_scale=5.0)"
                         ))
-    # Hidden args used internally by multi-GPU subprocess workers
-    parser.add_argument("--shard-rank", type=int, default=0, help=argparse.SUPPRESS)
-    parser.add_argument("--shard-world", type=int, default=1, help=argparse.SUPPRESS)
-    parser.add_argument("--temp-out", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    gpu_list = [int(x.strip()) for x in args.gpu.split(",")]
     ckpt_path = Path(args.ckpt)
 
     # Directory mode: evaluate every .pt file found inside
-    if ckpt_path.is_dir() and args.shard_world == 1:
+    if ckpt_path.is_dir():
         ckpt_files = sorted(ckpt_path.glob("*.pt"))
         if not ckpt_files:
             raise FileNotFoundError(f"No .pt files found in {ckpt_path}")
@@ -675,11 +581,11 @@ def main():
             out_sub = base_out / cf.stem
             print(f"\n{'='*80}")
             print(f"[EVAL] === Checkpoint: {cf.name} ===")
-            _eval_one_ckpt(cf, args, gpu_list, out_sub)
+            _eval_one_ckpt(cf, args, args.gpu, out_sub)
         return
 
     out_dir = Path(args.out) if args.out else DEFAULT_OUT_DIR
-    _eval_one_ckpt(ckpt_path, args, gpu_list, out_dir)
+    _eval_one_ckpt(ckpt_path, args, args.gpu, out_dir)
 
 if __name__ == "__main__":
     main()

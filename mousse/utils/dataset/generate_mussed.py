@@ -8,7 +8,7 @@ from pydub import AudioSegment
 
 # Audio constants
 RANDOM_SEED = 42
-TARGET_DBFS = -23.0         # EBU R128 target loudness (RMS-approximated via dBFS)
+TARGET_DBFS = -23.0         # EBU R128 target loudness using a dBFS approximation
 GAIN_VARIATION_DB = 3.0     # ± dB random gain per speaker to simulate volume variation
 MIN_SPK_DUR_SEC = 1.5       # discard source utterances shorter than this
 MIN_MIX_DUR_SEC = 3.0
@@ -270,7 +270,7 @@ def mix_speakers(selected_utterances, output_wav_path):
         end_sec = round(spk_timings[idx][1] / 1000.0, 3)
         dur_sec = round((spk_timings[idx][1] - spk_timings[idx][0]) / 1000.0, 3)
 
-        # org_speech_* = boundaries in the original source file (before trimming)
+        # Original source boundaries before trimming
         raw_sp_s = utt.get("speech_start")
         raw_sp_e = utt.get("speech_end")
         try:
@@ -284,7 +284,7 @@ def mix_speakers(selected_utterances, output_wav_path):
         except (ValueError, TypeError):
             org_sp_end = org_sp_start + dur_sec
 
-        # speech_* in the mixture = full segment boundaries (audio was trimmed to speech)
+        # Speech boundaries in the generated mixture
         spk_entry = {
             "speaker_id": utt["speaker_id"],
             "speaker_name": utt.get("speaker_name", "Unknown"),
@@ -361,8 +361,7 @@ def main():
         print("CRITICAL: One or more pools are empty. Check paths above.")
         return
 
-    # Speaker-first groups: each speaker gets equal sampling probability
-    # regardless of how many utterances they contributed.
+    # Equal speaker sampling across utterance counts
     en_train_grp = _group_by_speaker(en_train_pool)
     en_dev_grp   = _group_by_speaker(en_dev_pool)
     en_test_grp  = _group_by_speaker(en_test_pool)

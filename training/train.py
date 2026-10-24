@@ -1,15 +1,12 @@
 import os
 import sys
 
-# Make the top-level ``mousse`` package importable when running this script
-# directly (repo root is the parent of this training/ directory).
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
-import shutil
 import time
 import math
 import random
@@ -24,7 +21,7 @@ import torch.nn.functional as F
 import torch.autograd.forward_ad as fwad
 from einops import rearrange, reduce
 from tqdm import tqdm
-from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate import Accelerator
 import wandb
 import torchaudio
 from scipy.optimize import linear_sum_assignment
@@ -56,13 +53,12 @@ for _p in [SAVE_PATH, ]:
 print(f"SAVE_PATH: {SAVE_PATH}")
 
 FULL_STEPS = 120000
-FULL_SAVE_EV = [30000, 47500, 60000] # 10000
+FULL_SAVE_EV = [30000, 47500, 60000]
 FULL_EVAL_EV = 1000
 TRAIN_LOG_EVERY = 1
 
 # Early stopping
-# Fires after EARLY_STOP_PATIENCE_EVALS consecutive evals without ≥ EARLY_STOP_MIN_DELTA_DB gain.
-# At eval_every=1000 and patience=20 this means 20 000 steps without meaningful improvement.
+# Stop after consecutive evaluations without the minimum SI-SNRi gain.
 EARLY_STOP_PATIENCE_EVALS = 20
 EARLY_STOP_MIN_DELTA_DB = 0.2
 
@@ -80,10 +76,10 @@ HYPERPARAM: Dict[str, Any] = {
 
 # Dataset / training constants
 N_SRC_LIST  = [2, 3, 4]
-VAL_SAMPLES_PER_NSRC = 1300 #100
+VAL_SAMPLES_PER_NSRC = 1300
 TRAIN_LOADER_WORKERS = 5
 TRAIN_MIXED_PRECISION = "bf16"
-MAX_FRAMES_PER_SPK = 600 #300
+MAX_FRAMES_PER_SPK = 600
 MAX_EVAL_FRAMES_PER_SPK = 1500
 
 train_project = "mousse"
@@ -204,13 +200,13 @@ def compute_eval_stats(
                 cond = batch[0].to(device)
                 tgt = batch[1].to(device)
                 
-                # Dynamic determination of single speaker frames
+                # Frames per speaker
                 if tgt.ndim == 4:
                     T_single = tgt.shape[2]
                 else:
                     T_single = cond.shape[1] // n_src
                     
-                # Enforce frame length truncation rule
+                # Frame limit
                 if T_single > MAX_FRAMES_PER_SPK:
                     T_single = MAX_FRAMES_PER_SPK
 
@@ -223,7 +219,7 @@ def compute_eval_stats(
                     tgt_flat = tgt
                     cond_flat = cond
 
-                # Slice time dimensions to the target T_total limit
+                # Shared time limit
                 tgt_flat = tgt_flat[:, :T_total, :]
                 cond_flat = cond_flat[:, :T_total, :]
 
@@ -241,7 +237,7 @@ def compute_eval_stats(
                 with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                     pred = predictor(audio=norm_cond, noise=z, times=u)
                 
-                # Compute MSE loss based on time-concatenated 1:1 Target Speaker Extraction
+                # Time-concatenated target speaker loss
                 loss = F.mse_loss(pred.float(), vel_tgt.float())
                 total_loss += loss.item()
                 
@@ -333,8 +329,7 @@ def patched_sample_with_uncertainty(self, *, audio, uq_head, steps, alpha=1.5, l
 
 
 def apply_training_patches():
-    """Install the shared forward patches, plus the training-only
-    uncertainty-aware sampler (AudioFlow.sample_with_uncertainty)."""
+    """Install forward patches and the training uncertainty sampler."""
     sf_model = apply_forward_patches()
     sf_model.AudioFlow.sample_with_uncertainty = patched_sample_with_uncertainty
 
@@ -346,11 +341,10 @@ def cycle(dl):
 
 
 def _make_train_collate(base_collate, max_frames_per_spk, hop_size):
-    """Wraps dataset collate to randomly crop each waveform to max_frames_per_spk
-    before spectrogram computation.  This (a) exposes different overlap regions on
-    each pass through the data for clips longer than the crop window, and (b) prevents
-    large zero-padded tensors from being created and transferred to the GPU only to be
-    immediately discarded in the training loop."""
+    """Randomly crop waveforms before spectrogram computation.
+
+    Cropping varies overlap regions and limits zero padding on the GPU.
+    """
     max_samples = max_frames_per_spk * hop_size
 
     def collate_with_crop(batch):
@@ -488,10 +482,6 @@ def run_training(
     clip_norm = hp.get("clip_norm", 0.2)
     sigma = hp.get("sigma", 1e-5)
     warmup_steps = hp.get("warmup_steps", 3000)
-
-    if accelerator is not None:
-        lr_max   *= accelerator.num_processes
-        lr_start *= accelerator.num_processes
 
     optim = torch.optim.AdamW(
         [
@@ -701,7 +691,7 @@ def run_training(
                     if _plateau is not None:
                         _plateau.step(si_snri)
 
-                    # Early stopping (full-training only)
+                    # Full training early stop
                     if full_eval:
                         if si_snri >= prev_best + EARLY_STOP_MIN_DELTA_DB:
                             no_improve_evals = 0
@@ -770,8 +760,12 @@ def main():
 
     apply_training_patches()
 
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs], mixed_precision=TRAIN_MIXED_PRECISION)
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        raise RuntimeError("Training supports one GPU process only")
+
+    accelerator = Accelerator(log_with="wandb", mixed_precision=TRAIN_MIXED_PRECISION)
+    if accelerator.num_processes != 1:
+        raise RuntimeError("Training supports one GPU process only")
     device = accelerator.device
 
     torch.backends.cuda.matmul.allow_tf32 = True
