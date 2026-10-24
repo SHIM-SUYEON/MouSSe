@@ -8,25 +8,19 @@ from pydub import AudioSegment
 
 # Audio constants
 RANDOM_SEED = 42
-TARGET_DBFS = -23.0         # EBU R128 target loudness using a dBFS approximation
-GAIN_VARIATION_DB = 3.0     # ± dB random gain per speaker to simulate volume variation
-MIN_SPK_DUR_SEC = 1.5       # discard source utterances shorter than this
+TARGET_DBFS = -23.0
+GAIN_VARIATION_DB = 3.0
+MIN_SPK_DUR_SEC = 1.5
 MIN_MIX_DUR_SEC = 3.0
 MAX_MIX_DUR_SEC = 15.0
 TARGET_SR = 16000
 OVERLAP_OPTIONS = [0.0, 0.25, 0.50, 0.75, 1.00]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Dataset paths
-# libri_dir contains SPEAKERS.txt and the train-clean-100, dev-clean, and
-# test-clean LibriTTS-R splits. The Korean corpus roots correspond to its
-# 1.Training and 2.Validation splits. Generated mixtures and metadata are
-# stored below output_base_dir.
-# ─────────────────────────────────────────────────────────────────────────────
+# Dataset roots
 libri_dir = "/data/LibriTTS-R/LibriTTS_R/"
 kor_train_dir = "/data/korean-speech/014.multispeaker_audio_data/01.data/1.Training/"
 kor_val_dir = "/data/korean-speech/014.multispeaker_audio_data/01.data/2.Validation/"
-output_base_dir = "/data/MuSSeD/"
+output_base_dir = "/data/MuSSeD-EnKo/"
 
 # Paths derived from the dataset roots.
 output_train = os.path.join(output_base_dir, "train")

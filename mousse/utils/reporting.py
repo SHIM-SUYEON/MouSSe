@@ -18,10 +18,10 @@ OVERLAP_CATS = ["0", "25", "50", "75", "100"]
 # Category accumulator helpers 
 def _make_acc():
     return {
-        "sisdri": 0.0, "n_sisdri": 0,         # SI-SDRi
-        "sdri": 0.0, "n_sdri": 0,             # SDRi
-        "estoii": 0.0, "n_estoii": 0,         # ESTOi improvement over mixture baseline
-        "uq": 0.0, "n_uq": 0,                 # UQ sigma_cond
+        "sdri": 0.0, "n_sdri": 0, # SDRi
+        "sisdri": 0.0, "n_sisdri": 0, # SI-SDRi
+        "estoii": 0.0, "n_estoii": 0, # ESTOi improvement over mixture baseline
+        "uq": 0.0, "n_uq": 0, # UQ sigma_cond
         "n_samples": 0,
     }
 
