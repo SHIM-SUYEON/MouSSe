@@ -4,13 +4,13 @@
 flow-matching speech separator with a per-frame uncertainty (UQ) head and
 adaptive UQ-guided classifier-free guidance.
 
-This repository contains the code needed to **train** and **evaluate** the
+This repository contains the code needed to train and evaluate the
 model reported in the paper.
 
 ## Examples
 
-Each panel shows the input **mixture** (top) and, per source, the
-**ground-truth** (left) vs. the model's **separated** mel-spectrogram (right),
+Each panel shows the input mixture (top) and, per source, the
+ground-truth (left) vs. the model's separated mel-spectrogram (right),
 across increasing speaker counts and overlap ratios.
 
 | 2 speakers · 25% overlap | 3 speakers · 50% overlap | 4 speakers · 75% overlap |
@@ -44,8 +44,7 @@ MOUSSE/
 └── LICENSE
 ```
 
-All scripts are meant to be **run from the repository root** so that the
-top-level `mousse` package is importable.
+All scripts are meant to be run from the repository root so that the `mousse` package is importable.
 
 ## Installation
 
@@ -73,9 +72,8 @@ scp/<N>spk/
 
 The paths inside the manifests point to the private MUSSED mixture set
 (`/data/...`). Reproduction on another machine requires regenerated mixtures
-and updated paths in the `.scp` files (or an `scp_base_dir` setting/symlink that
-resolves those locations). Speaker counts of 2, 3 and 4 are selected via the
-dataset key `mussed2` / `mussed3` / `mussed4`.
+and updated paths in the `.scp` files or an `scp_dir` setting/symlink that
+resolves those locations.
 
 ### Regenerating the mixtures
 
@@ -90,8 +88,8 @@ python mousse/utils/dataset/generate_mussed.py
 
 It writes `<N>spk/{raw,json}/` — the mixture `.wav` files plus a per-mixture
 metadata `.json` (speakers, overlap ratio, timings). Regenerate the `.scp`
-manifests from those outputs (or update the paths in the shipped `.scp` files).
-Requires `pydub` + `ffmpeg` (see `requirements.txt`).
+manifests from those outputs or update the paths in the shipped `.scp` files.
+Requires `pydub` + `ffmpeg`.
 
 ## Configuration
 
