@@ -115,8 +115,7 @@ Evaluation seeds Python's RNG with `random.seed(42)`.
 python training/train.py
 ```
 
-> Note: `training/train.py` pins `CUDA_VISIBLE_DEVICES = "0"` at the top of the
-> file (as used for the paper run). Change this value when selecting another GPU.
+> Note: `training/train.py` pins `CUDA_VISIBLE_DEVICES = "0"`. Change this value when selecting another GPU.
 > Runs are logged to Weights & Biases under the project `mousse`.
 
 ## Evaluation
