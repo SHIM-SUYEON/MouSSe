@@ -62,7 +62,7 @@ required the first time evaluation runs.
 ## Data
 
 Training and evaluation read Kaldi-style `.scp` manifests, one line per audio
-file. The test-set manifests (1300 mixtures per speaker count) ship in
+file. The test-set manifests ship in
 [mousse/utils/dataset/scp/](mousse/utils/dataset/scp/):
 
 ```
